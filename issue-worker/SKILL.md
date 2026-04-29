@@ -11,14 +11,38 @@ This skill is cross-agent: it must work for Codex, OpenCode, Claude Code, Cursor
 
 ## First Steps
 
-1. Check whether `.issue-worker/project.json` exists in the repository root.
-2. If it does not exist, run or guide the user through `issue-worker init`.
-3. If it exists, run `issue-worker doctor`.
-4. Check `git status` before editing code. If the worktree contains user changes, do not overwrite them; explain the risk and ask how to proceed.
-5. Read the issue before coding:
-   - `issue-worker issues get <id>`
-   - include comments, labels, state, and any linked PR/MR information when available.
-6. Extract the requirement before implementation: goal, acceptance criteria, risks, unclear points, and likely files or subsystems.
+1. Run from the repository root. If the `issue-worker` command is not on `PATH`, invoke the bundled CLI directly:
+
+   ```bash
+   python3 <skill-dir>/scripts/issue-worker <subcommand>
+   ```
+
+2. Check whether `.issue-worker/project.json` exists.
+3. If it does not exist, initialize it before asking for issue content:
+   - Run `issue-worker init --username <local-or-repo-username>` when the remote lets provider detection succeed.
+   - If provider detection needs help, pass explicit options such as `--provider gitlab --api-base-url https://git.arlth.cn/api/v4 --username huhw`.
+   - `init` may succeed without a token; it still records non-sensitive project config so future agents know how to continue.
+4. Run `issue-worker doctor`.
+5. If `doctor` says the token is missing, do not try the web UI or conclude the issue is inaccessible. Configure credentials first:
+   - Prefer `issue-worker token set` so hidden input stores the token under `credentialRef`.
+   - If non-interactive or the user has not provided a token locally, ask specifically for a local token setup, not for pasted issue text.
+   - Tell the user the minimum scope: issue reads usually need `read_api` on GitLab, Issues read on GitHub, and issue read permission on Gitee.
+6. Check `git status` before editing code. If the worktree contains user changes, do not overwrite them; explain the risk and ask how to proceed.
+7. Get issue content through the CLI:
+   - If the user provided an id or URL, run `issue-worker issues get <id> --json`.
+   - If the user only said "handle the issue", run `issue-worker issues list --state open --limit 20` and pick an obvious single open issue; if multiple issues are plausible, ask which one.
+   - Include comments, labels, state, and linked PR/MR information when available.
+8. Extract the requirement before implementation: goal, acceptance criteria, risks, unclear points, and likely files or subsystems.
+
+## Recovery When Issue Access Fails
+
+Do not stop after discovering the repository has no local business code or the browser shows a login page. The issue tracker is the source of requirements, so use this recovery order:
+
+1. Ensure `.issue-worker/project.json` exists. If missing, run `issue-worker init` or create it from the git remote with explicit provider/API options.
+2. Run `issue-worker doctor` and report the exact failing check.
+3. If token is missing, ask the user to run `issue-worker token set` or otherwise make a token available through local credential storage or a temporary environment variable. Do not ask the user to paste the token into chat.
+4. If token exists but API lookup fails, report provider, host, repo path/project id, endpoint type, HTTP status, and likely cause.
+5. Only ask for the issue body or issue link as a fallback after the CLI path is initialized and token/API recovery is blocked.
 
 Read these references when needed:
 
@@ -62,7 +86,7 @@ If git credential storage is unavailable, the CLI may fall back to a local priva
 
 ### Prepare
 
-- Run `issue-worker doctor`.
+- Run `issue-worker doctor`; if it fails because config or credentials are missing, follow "Recovery When Issue Access Fails" before asking the user for issue text.
 - Confirm the current git repository matches `.issue-worker/project.json`.
 - Inspect `git status`.
 - Read the issue title, description, comments, labels, and linked PR/MR details where supported.
@@ -80,6 +104,8 @@ Follow `workflow.branchMode` from `.issue-worker/project.json`:
 - `always`: create a branch from `defaultBranch` named `issue/{issueId}-{short-slug}`.
 - `ask`: ask the user before creating the branch.
 - `never`: work on the current branch, but warn about the risk.
+
+If the user asked you to implement the issue and branch policy is `ask`, ask a short branch question only if creating a branch is material to the workflow. Otherwise continue on the current branch after noting the policy.
 
 Ask before posting a "started work" comment unless project workflow policy explicitly allows it.
 
@@ -122,14 +148,16 @@ Use the CLI from the skill directory or put `issue-worker/scripts` on `PATH`.
 
 ```bash
 issue-worker init
+issue-worker init --provider gitlab --api-base-url https://git.arlth.cn/api/v4 --username huhw
 issue-worker doctor
 issue-worker token set
 issue-worker token test
 issue-worker token remove
 issue-worker issues list --state open
-issue-worker issues get 123
+issue-worker issues list --state open --limit 20 --json
+issue-worker issues get 123 --json
 issue-worker issues create --title "Bug title" --body "Description" --confirm
-issue-worker issues comment 123 --body "Status update..."
+issue-worker issues comment 123 --body "Status update..." --confirm
 issue-worker issues close 123 --confirm
 issue-worker work start 123
 issue-worker work start 123 --create-branch --confirm
@@ -138,6 +166,12 @@ issue-worker work finish 123 --create-pr --confirm
 ```
 
 `work start --create-branch` can create a remote branch through the provider API. `work finish --create-pr` can create a GitHub/Gitee PR or GitLab MR through the provider API. Both require confirmation in non-interactive use.
+
+When `issue-worker` is not installed globally, replace `issue-worker` with:
+
+```bash
+python3 /home/airness/.agents/skills/issue-worker/scripts/issue-worker
+```
 
 ## Validation
 
