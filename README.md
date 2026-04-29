@@ -12,10 +12,22 @@
 npx skills add https://gitee.com/airnessnn/git-issue-worker-skill.git --list
 ```
 
+也可以使用 GitHub 镜像：
+
+```bash
+npx skills add https://github.com/AirNessNN/git-issue-worker-skill.git --list
+```
+
 安装 `issue-worker` 到当前项目：
 
 ```bash
 npx skills add https://gitee.com/airnessnn/git-issue-worker-skill.git --skill issue-worker
+```
+
+使用 GitHub 源安装：
+
+```bash
+npx skills add https://github.com/AirNessNN/git-issue-worker-skill.git --skill issue-worker
 ```
 
 安装到当前用户的全局 skill：
@@ -24,10 +36,22 @@ npx skills add https://gitee.com/airnessnn/git-issue-worker-skill.git --skill is
 npx skills add https://gitee.com/airnessnn/git-issue-worker-skill.git --skill issue-worker --global
 ```
 
+或从 GitHub 安装到全局：
+
+```bash
+npx skills add https://github.com/AirNessNN/git-issue-worker-skill.git --skill issue-worker --global
+```
+
 为所有支持的 agent 全局安装，并跳过确认提示：
 
 ```bash
 npx skills add https://gitee.com/airnessnn/git-issue-worker-skill.git --global --all
+```
+
+GitHub 源对应命令：
+
+```bash
+npx skills add https://github.com/AirNessNN/git-issue-worker-skill.git --global --all
 ```
 
 安装完成后，在处理仓库 Issue 时告诉 agent 使用 `issue-worker` skill，例如：
