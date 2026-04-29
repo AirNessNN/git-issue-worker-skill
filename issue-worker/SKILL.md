@@ -43,6 +43,7 @@ Preserve commands, code identifiers, branch names, commit hashes, API fields, an
 7. Get issue content through the CLI:
    - If the user provided an id or URL, run `issue-worker issues get <id> --json`.
    - If the user only said "handle the issue", run `issue-worker issues list --state open --limit 20` and pick an obvious single open issue; if multiple issues are plausible, ask which one.
+   - `--state open` is the normalized CLI value. The GitLab adapter maps it to GitLab's `opened` API value internally.
    - Include comments, labels, state, and linked PR/MR information when available.
 8. Extract the requirement before implementation: goal, acceptance criteria, risks, unclear points, and likely files or subsystems.
 
@@ -162,6 +163,7 @@ Use the CLI from the skill directory or put `issue-worker/scripts` on `PATH`.
 issue-worker init
 issue-worker init --provider gitlab --api-base-url https://git.arlth.cn/api/v4 --username huhw
 issue-worker doctor
+issue-worker doctor --json
 issue-worker token set
 issue-worker token test
 issue-worker token remove
@@ -170,14 +172,18 @@ issue-worker issues list --state open --limit 20 --json
 issue-worker issues get 123 --json
 issue-worker issues create --title "Bug title" --body "Description" --confirm
 issue-worker issues comment 123 --body "进度更新..." --confirm
+issue-worker issues comment 123 --body "进度更新..." --confirm --json
 issue-worker issues close 123 --confirm
+issue-worker issues close 123 --confirm --json
 issue-worker work start 123
-issue-worker work start 123 --create-branch --confirm
+issue-worker work start 123 --create-branch --confirm --json
 issue-worker work finish 123
-issue-worker work finish 123 --create-pr --confirm
+issue-worker work finish 123 --create-pr --confirm --json
 ```
 
 `work start --create-branch` can create a remote branch through the provider API. `work finish --create-pr` can create a GitHub/Gitee PR or GitLab MR through the provider API. Both require confirmation in non-interactive use.
+
+Prefer `--json` for agent parsing on `doctor`, `work start`, `work finish`, `issues comment`, and `issues close`. The workflow JSON includes git preflight warnings and `next_actions` so agents do not have to scrape human guidance text.
 
 When `issue-worker` is not installed globally, replace `issue-worker` with:
 

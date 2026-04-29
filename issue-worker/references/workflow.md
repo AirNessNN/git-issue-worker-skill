@@ -5,6 +5,7 @@ This workflow turns a repository issue into implemented, verified, and communica
 ## A. Prepare
 
 1. Run `issue-worker doctor`. If `issue-worker` is not on `PATH`, use the bundled command `python3 <skill-dir>/scripts/issue-worker doctor`.
+   - Prefer `issue-worker doctor --json` when an agent needs stable machine-readable setup status, token status, and next actions.
 2. Confirm `.issue-worker/project.json` matches the current git remote and repository.
 3. Run `git status`.
 4. If the worktree has user changes, do not overwrite them. Explain the risk and ask how to proceed.
@@ -49,6 +50,8 @@ The CLI can create the remote branch when the user or policy confirms it:
 ```bash
 issue-worker work start <issueId> --create-branch --confirm
 ```
+
+For agent parsing, add `--json`. The structured result includes the issue, branch/base, workflow policy, git preflight warnings, and `next_actions`.
 
 ## D. Implement
 
@@ -104,6 +107,8 @@ The CLI can create a PR/MR when the user or policy confirms it:
 ```bash
 issue-worker work finish <issueId> --create-pr --confirm
 ```
+
+For agent parsing, add `--json`. The structured result includes whether the PR/MR was created, its URL when available, git preflight status, comment/close policy reasons, and `next_actions`.
 
 If no PR/MR is created and the work is complete, ask whether to close the issue. Before closing, comment with the completion summary and validation result.
 

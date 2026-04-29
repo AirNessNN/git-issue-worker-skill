@@ -55,6 +55,14 @@ def init_git_repo(remote_url):
     return tmp, repo
 
 
+def commit_file(repo, path="README.md", text="test\n"):
+    target = repo / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+    git(["add", path], repo)
+    git(["-c", "user.name=Test Agent", "-c", "user.email=test@example.com", "commit", "-q", "-m", f"add {path}"], repo)
+
+
 class FakeGitLabState:
     def __init__(self):
         self.base_issues = [
@@ -125,6 +133,10 @@ class FakeGitLabHandler(BaseHTTPRequestHandler):
             self._send(200, {"id": 1093, "path_with_namespace": "huhw/issue-test", "default_branch": "main"})
             return
         if path == "/api/v4/projects/huhw%2Fissue-test/issues":
+            state = query.get("state", [""])[0]
+            if state == "open":
+                self._send(400, {"message": "state does not have a valid value"})
+                return
             page = query.get("page", ["1"])[0]
             if self.state.created_issues:
                 self._send(200, self.state.all_issues())
@@ -332,6 +344,12 @@ class FakeGitLabAgentScenarioTests(unittest.TestCase):
                 listed = run_cmd(["issues", "list", "--state", "open", "--limit", "2", "--json"], repo, env=env)
                 issues = json.loads(listed.stdout)
                 self.assertEqual([issue["iid"] for issue in issues], [1, 2])
+                issue_list_query = [
+                    request[2]
+                    for request in server.state.requests
+                    if request[0] == "GET" and request[1] == "/api/v4/projects/huhw%2Fissue-test/issues"
+                ][0]
+                self.assertEqual(issue_list_query["state"], ["opened"])
 
                 got = run_cmd(["issues", "get", "1", "--json"], repo, env=env)
                 payload = json.loads(got.stdout)
@@ -371,6 +389,15 @@ class FakeGitLabAgentScenarioTests(unittest.TestCase):
                 commented_get = run_cmd(["issues", "get", "3", "--json"], repo, env=env)
                 commented_payload = json.loads(commented_get.stdout)
                 self.assertEqual(commented_payload["comments"][0]["body"], "Agent progress update")
+
+                comment_json = run_cmd(
+                    ["issues", "comment", "3", "--body", "Structured progress update", "--confirm", "--json"],
+                    repo,
+                    env=env,
+                )
+                comment_payload = json.loads(comment_json.stdout)
+                self.assertTrue(comment_payload["comment"]["posted"])
+                self.assertEqual(comment_payload["comment"]["raw"]["body"], "Structured progress update")
 
                 start = run_cmd(
                     [
@@ -412,11 +439,70 @@ class FakeGitLabAgentScenarioTests(unittest.TestCase):
                 self.assertIn("MR created", finish.stdout)
                 self.assertEqual(server.state.merge_requests[0]["source_branch"], "issue/1-fix-worker")
 
-                closed = run_cmd(["issues", "close", "3", "--confirm"], repo, env=env)
-                self.assertIn("Issue closed", closed.stdout)
+                finish_json = run_cmd(
+                    [
+                        "work",
+                        "finish",
+                        "1",
+                        "--create-pr",
+                        "--branch",
+                        "issue/1-fix-worker",
+                        "--base",
+                        "main",
+                        "--title",
+                        "Fix #1: Fix worker",
+                        "--body",
+                        "Issue: fake\n\nValidation: fake",
+                        "--confirm",
+                        "--json",
+                    ],
+                    repo,
+                    env=env,
+                )
+                finish_payload = json.loads(finish_json.stdout)
+                self.assertTrue(finish_payload["mr"]["created"])
+                self.assertEqual(finish_payload["mr"]["url"], "http://fake/mr/7")
+                self.assertIn("comment_issue_completion", finish_payload["next_actions"])
+                self.assertIn("preflight", finish_payload)
+
+                closed = run_cmd(["issues", "close", "3", "--confirm", "--json"], repo, env=env)
+                closed_payload = json.loads(closed.stdout)
+                self.assertTrue(closed_payload["close"]["performed"])
                 closed_get = run_cmd(["issues", "get", "3", "--json"], repo, env=env)
                 closed_payload = json.loads(closed_get.stdout)
                 self.assertEqual(closed_payload["issue"]["state"], "closed")
+
+    def test_json_doctor_and_work_start_preflight(self):
+        with FakeGitLabServer() as server:
+            tmp, repo = init_git_repo("git@git.arlth.cn:huhw/issue-test.git")
+            with tmp:
+                commit_file(repo)
+                write_project_config(repo, server.url)
+                (repo / "scratch.txt").write_text("temporary\n", encoding="utf-8")
+                env = {"ISSUE_WORKER_TOKEN": FakeGitLabHandler.token}
+
+                doctor = run_cmd(["doctor", "--json"], repo, env=env)
+                doctor_payload = json.loads(doctor.stdout)
+                self.assertTrue(doctor_payload["ok"])
+                self.assertEqual(doctor_payload["config"]["provider"], "gitlab")
+                self.assertTrue(doctor_payload["token"]["found"])
+
+                start = run_cmd(["work", "start", "1", "--local", "--json"], repo, env=env)
+                start_payload = json.loads(start.stdout)
+                self.assertIn("preflight", start_payload)
+                self.assertIn("scratch.txt", start_payload["preflight"]["status"]["untracked"])
+                self.assertIn("review_worktree_changes", start_payload["next_actions"])
+
+    def test_invalid_state_error_is_actionable(self):
+        with FakeGitLabServer() as server:
+            tmp, repo = init_git_repo("git@git.arlth.cn:huhw/issue-test.git")
+            with tmp:
+                write_project_config(repo, server.url)
+                env = {"ISSUE_WORKER_TOKEN": FakeGitLabHandler.token}
+                proc = run_cmd(["issues", "list", "--state", "bad-state"], repo, env=env, check=False)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("[gitlab/issues/list] invalid state value", proc.stderr)
+                self.assertIn("Suggestion: retry with --state open", proc.stderr)
 
     def test_write_commands_require_confirmation_in_non_interactive_mode(self):
         with FakeGitLabServer() as server:

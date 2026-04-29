@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 APP_NAME = "issue-worker"
@@ -39,6 +39,19 @@ DEFAULT_WORKFLOW = {
     "autoClose": "after_merge_or_confirm",
     "commentPolicy": "progress_blocker_done",
 }
+ISSUE_STATES = {"open", "opened", "closed", "all"}
+PROVIDER_STATES = {
+    "github": {"open", "closed", "all"},
+    "gitlab": {"opened", "closed", "all"},
+    "gitee": {"open", "closed", "all"},
+}
+NORMALIZED_STATE_ALIASES = {
+    "open": "open",
+    "opened": "open",
+    "closed": "closed",
+    "close": "closed",
+    "all": "all",
+}
 
 
 class IssueWorkerError(Exception):
@@ -50,6 +63,32 @@ class ApiResult:
     status: int
     data: Any
     headers: Dict[str, str]
+
+
+@dataclass
+class GitStatus:
+    current_branch: str
+    staged: List[str]
+    unstaged: List[str]
+    untracked: List[str]
+
+    @property
+    def dirty(self) -> bool:
+        return bool(self.staged or self.unstaged or self.untracked)
+
+
+@dataclass
+class GitPreflight:
+    command: str
+    branch: str
+    base: str
+    default_branch: str
+    status: GitStatus
+    warnings: List[str]
+    errors: List[str]
+    next_actions: List[str]
+    ahead_count: int = 0
+    pushed: Optional[bool] = None
 
 
 def eprint(message: str = "") -> None:
@@ -65,6 +104,10 @@ def safe_print(message: str = "") -> None:
         print(message)
     except BrokenPipeError:
         raise SystemExit(0)
+
+
+def print_json(data: Any) -> None:
+    safe_print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
 def ui_language() -> str:
@@ -121,6 +164,20 @@ def run_git(args: List[str], cwd: Optional[Path] = None, check: bool = True) -> 
     return proc.stdout.strip()
 
 
+def run_git_proc(args: List[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git"] + args,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        die("git is required but was not found on PATH.")
+
+
 def git_root() -> Path:
     output = run_git(["rev-parse", "--show-toplevel"])
     if not output:
@@ -134,6 +191,74 @@ def is_git_repo() -> bool:
         return True
     except IssueWorkerError:
         return False
+
+
+def git_status() -> GitStatus:
+    current_branch = run_git(["branch", "--show-current"], check=False)
+    staged: List[str] = []
+    unstaged: List[str] = []
+    untracked: List[str] = []
+    output = run_git(["status", "--porcelain"], check=True)
+    for line in output.splitlines():
+        if not line:
+            continue
+        code = line[:2]
+        path = line[3:] if len(line) > 3 else ""
+        if " -> " in path:
+            path = path.rsplit(" -> ", 1)[-1]
+        if code == "??":
+            untracked.append(path)
+            continue
+        if code[0] != " ":
+            staged.append(path)
+        if code[1] != " ":
+            unstaged.append(path)
+    return GitStatus(current_branch=current_branch, staged=staged, unstaged=unstaged, untracked=untracked)
+
+
+def current_branch() -> str:
+    return run_git(["branch", "--show-current"], check=False)
+
+
+def git_ref_exists(ref: str) -> bool:
+    proc = run_git_proc(["rev-parse", "--verify", "--quiet", ref])
+    return proc.returncode == 0
+
+
+def git_upstream(branch: Optional[str] = None) -> str:
+    ref = f"{branch}@{{upstream}}" if branch else "@{upstream}"
+    return run_git(["rev-parse", "--abbrev-ref", ref], check=False)
+
+
+def git_ahead_count(base: str, branch: str) -> int:
+    if not base or not branch:
+        return 0
+    base_ref = base
+    if not git_ref_exists(base_ref):
+        for candidate in (f"origin/{base}", f"refs/remotes/origin/{base}", f"refs/heads/{base}"):
+            if git_ref_exists(candidate):
+                base_ref = candidate
+                break
+    if not git_ref_exists(base_ref) or not git_ref_exists(branch):
+        return 0
+    output = run_git(["rev-list", "--count", f"{base_ref}..{branch}"], check=False)
+    try:
+        return int(output.strip() or "0")
+    except ValueError:
+        return 0
+
+
+def git_branch_pushed(branch: str) -> Optional[bool]:
+    if not branch:
+        return None
+    upstream = git_upstream(branch)
+    if not upstream:
+        return False
+    local = run_git(["rev-parse", branch], check=False)
+    remote = run_git(["rev-parse", upstream], check=False)
+    if not local or not remote:
+        return False
+    return local == remote
 
 
 def load_project_config(root: Optional[Path] = None) -> Dict[str, Any]:
@@ -598,7 +723,15 @@ class ProviderAdapter:
         except urllib.error.HTTPError as exc:
             raw = exc.read()
             parsed = parse_response_body(raw)
-            raise_api_error(self.provider, self.host, endpoint_type, exc.code, parsed)
+            raise_api_error(
+                self.provider,
+                self.host,
+                endpoint_type,
+                exc.code,
+                parsed,
+                query=query,
+                body=body,
+            )
         except urllib.error.URLError as exc:
             die(
                 f"{self.provider} {self.host} {endpoint_type} request failed before HTTP response: "
@@ -951,13 +1084,24 @@ def safe_error_message(data: Any) -> str:
     return str(data)[:500]
 
 
-def raise_api_error(provider: str, host: str, endpoint_type: str, status: int, data: Any) -> None:
+def raise_api_error(
+    provider: str,
+    host: str,
+    endpoint_type: str,
+    status: int,
+    data: Any,
+    *,
+    query: Optional[Dict[str, Any]] = None,
+    body: Optional[Any] = None,
+) -> None:
     message = safe_error_message(data)
     hints = status_hints(provider, status)
+    detail_lines = actionable_error_lines(provider, endpoint_type, status, message, query or {}, body)
     text = (
         f"{provider} {host} {endpoint_type} failed: HTTP {status}"
         + (f" - {message}" if message else "")
         + (f"\nLikely causes: {hints}" if hints else "")
+        + (("\n" + "\n".join(detail_lines)) if detail_lines else "")
     )
     die(text)
 
@@ -981,11 +1125,51 @@ def status_hints(provider: str, status: int) -> str:
     return ""
 
 
+def actionable_error_lines(
+    provider: str,
+    endpoint_type: str,
+    status: int,
+    message: str,
+    query: Dict[str, Any],
+    body: Optional[Any],
+) -> List[str]:
+    lines: List[str] = []
+    if query:
+        visible_query = {k: v for k, v in query.items() if k != "access_token"}
+        if visible_query:
+            lines.append(f"Request parameters: {json.dumps(visible_query, ensure_ascii=False)}")
+    if isinstance(body, dict):
+        visible_body = {k: v for k, v in body.items() if "token" not in str(k).lower()}
+        if visible_body:
+            lines.append(f"Request body fields: {', '.join(sorted(visible_body.keys()))}")
+    normalized_message = message.lower()
+    if endpoint_type == "issue list" and "state" in normalized_message:
+        expected = ", ".join(sorted(PROVIDER_STATES.get(provider, ISSUE_STATES)))
+        lines.append(f"Expected provider state values for {provider}: {expected}.")
+        if provider == "gitlab":
+            lines.append("Suggestion: use --state open for normalized CLI input; it is sent to GitLab as opened.")
+        else:
+            lines.append("Suggestion: use --state open, --state closed, or --state all.")
+    elif status in {400, 422}:
+        lines.append("Suggestion: check the command arguments and retry with provider-supported values.")
+    return lines
+
+
 def normalize_state_for_provider(provider: str, state: str) -> str:
-    state = state.lower()
-    if provider == "gitlab" and state == "closed":
-        return "closed"
-    return state
+    raw = state.strip().lower()
+    normalized = NORMALIZED_STATE_ALIASES.get(raw)
+    if not normalized:
+        expected = ", ".join(sorted(ISSUE_STATES))
+        provider_expected = ", ".join(sorted(PROVIDER_STATES.get(provider, ISSUE_STATES)))
+        die(
+            f"[{provider}/issues/list] invalid state value: {state}\n"
+            f"Expected normalized values: {expected}\n"
+            f"Provider values for {provider}: {provider_expected}\n"
+            "Suggestion: retry with --state open, --state closed, or --state all."
+        )
+    if provider == "gitlab" and normalized == "open":
+        return "opened"
+    return normalized
 
 
 def adapter_from_config(config: Dict[str, Any], require_token: bool = True) -> ProviderAdapter:
@@ -1068,6 +1252,199 @@ def validate_project_matches_remote(config: Dict[str, Any]) -> Tuple[bool, str]:
     if matches:
         return True, ", ".join(matches)
     return False, f"no remote matches host={config.get('host')} repoPath={config.get('repoPath')}"
+
+
+def status_to_json(status: GitStatus) -> Dict[str, Any]:
+    return {
+        "current_branch": status.current_branch,
+        "staged": status.staged,
+        "unstaged": status.unstaged,
+        "untracked": status.untracked,
+        "dirty": status.dirty,
+    }
+
+
+def preflight_to_json(preflight: GitPreflight) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "command": preflight.command,
+        "branch": preflight.branch,
+        "base": preflight.base,
+        "default_branch": preflight.default_branch,
+        "status": status_to_json(preflight.status),
+        "warnings": preflight.warnings,
+        "errors": preflight.errors,
+        "next_actions": preflight.next_actions,
+    }
+    if preflight.command == "finish":
+        payload["ahead_count"] = preflight.ahead_count
+        payload["pushed"] = preflight.pushed
+    return payload
+
+
+def build_work_start_preflight(config: Dict[str, Any], branch: str, base: str) -> GitPreflight:
+    status = git_status()
+    default_branch = str(config.get("defaultBranch") or "main")
+    warnings: List[str] = []
+    errors: List[str] = []
+    next_actions: List[str] = []
+    if not status.current_branch:
+        warnings.append("Detached HEAD detected; create or switch to an issue branch before editing.")
+        next_actions.append("create_or_switch_issue_branch")
+    elif status.current_branch == default_branch:
+        warnings.append(f"Current branch is the default branch {default_branch}; issue work should use {branch}.")
+        next_actions.append("create_or_switch_issue_branch")
+    elif status.current_branch != branch:
+        warnings.append(f"Current branch {status.current_branch} does not match recommended issue branch {branch}.")
+    if status.dirty:
+        warnings.append("Working tree has local changes; review them before starting issue work.")
+        next_actions.append("review_worktree_changes")
+    if status.untracked:
+        warnings.append("Untracked files detected; keep unrelated files out of the issue commit.")
+    if git_ref_exists(branch) or git_ref_exists(f"origin/{branch}") or git_ref_exists(f"refs/remotes/origin/{branch}"):
+        warnings.append(f"Branch already exists: {branch}.")
+        next_actions.append("reuse_or_rename_branch")
+    if not git_ref_exists(base) and not git_ref_exists(f"origin/{base}") and not git_ref_exists(f"refs/remotes/origin/{base}"):
+        warnings.append(f"Base branch {base} was not found locally; fetch or pass --base if needed.")
+        next_actions.append("fetch_base_branch")
+    return GitPreflight(
+        command="start",
+        branch=branch,
+        base=base,
+        default_branch=default_branch,
+        status=status,
+        warnings=dedupe(warnings),
+        errors=errors,
+        next_actions=dedupe(next_actions),
+    )
+
+
+def build_work_finish_preflight(config: Dict[str, Any], branch: str, base: str) -> GitPreflight:
+    status = git_status()
+    default_branch = str(config.get("defaultBranch") or "main")
+    warnings: List[str] = []
+    errors: List[str] = []
+    next_actions: List[str] = []
+    if not branch:
+        errors.append("Could not determine current branch; pass --branch explicitly.")
+        next_actions.append("pass_branch")
+    elif branch == default_branch:
+        warnings.append(f"Current branch is the default branch {default_branch}; creating a PR/MR from it is risky.")
+        next_actions.append("switch_to_issue_branch")
+    elif status.current_branch and status.current_branch != branch:
+        warnings.append(f"Command branch is {branch}, but the checked-out branch is {status.current_branch}.")
+    prefix = str((config.get("workflow") or {}).get("branchPrefix") or DEFAULT_WORKFLOW["branchPrefix"])
+    if branch and not branch.startswith(prefix):
+        warnings.append(f"Branch {branch} does not use configured issue branch prefix {prefix}.")
+    if status.staged or status.unstaged:
+        warnings.append("Working tree has uncommitted tracked changes; commit or stash before finish.")
+        next_actions.append("commit_or_stash_changes")
+    if status.untracked:
+        warnings.append("Untracked files detected; verify whether they belong to this issue before finish.")
+        next_actions.append("review_untracked_files")
+    ahead_count = git_ahead_count(base, branch) if branch else 0
+    if ahead_count == 0:
+        warnings.append(f"Branch {branch or '(unknown)'} has no local commits ahead of {base}.")
+        next_actions.append("commit_issue_changes")
+    pushed = git_branch_pushed(branch) if branch else None
+    if pushed is False:
+        warnings.append(f"Branch {branch} does not have an up-to-date upstream; push before creating a PR/MR.")
+        next_actions.append("push_branch")
+    return GitPreflight(
+        command="finish",
+        branch=branch,
+        base=base,
+        default_branch=default_branch,
+        status=status,
+        warnings=dedupe(warnings),
+        errors=errors,
+        next_actions=dedupe(next_actions),
+        ahead_count=ahead_count,
+        pushed=pushed,
+    )
+
+
+def dedupe(values: Sequence[str]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
+
+
+def print_preflight(preflight: GitPreflight) -> None:
+    if preflight.warnings:
+        safe_print("Git preflight warnings:")
+        for warning in preflight.warnings:
+            safe_print(f"- {warning}")
+    if preflight.errors:
+        safe_print("Git preflight errors:")
+        for error in preflight.errors:
+            safe_print(f"- {error}")
+    if preflight.next_actions:
+        safe_print("Preflight next actions:")
+        for action in preflight.next_actions:
+            safe_print(f"- {action}")
+
+
+def command_result_payload(
+    *,
+    config: Dict[str, Any],
+    issue_id: str,
+    issue: Dict[str, Any],
+    branch: str,
+    base: str,
+    workflow: Dict[str, Any],
+    preflight: Optional[GitPreflight] = None,
+    branch_result: Optional[Any] = None,
+    mr_result: Optional[Any] = None,
+    comment_result: Optional[Any] = None,
+    close_result: Optional[Any] = None,
+    next_actions: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    provider = str(config.get("provider"))
+    payload: Dict[str, Any] = {
+        "issue": {
+            "id": issue_id,
+            "number": issue_number(provider, issue) if issue else issue_id,
+            "title": issue_title(issue) if issue else "",
+            "state": issue_state(issue) if issue else "",
+            "url": issue_url(issue) if issue else issue_link(config, issue_id),
+        },
+        "branch": branch,
+        "base": base,
+        "workflow": workflow,
+        "next_actions": dedupe(next_actions or []),
+    }
+    if preflight:
+        payload["preflight"] = preflight_to_json(preflight)
+        payload["next_actions"] = dedupe(payload["next_actions"] + preflight.next_actions)
+    if branch_result is not None:
+        payload["remote_branch"] = {
+            "created": True,
+            "name": branch,
+            "url": pr_or_mr_url(branch_result),
+            "raw": branch_result,
+        }
+    if mr_result is not None:
+        label = pr_or_mr_label(provider).lower()
+        payload[label] = {
+            "created": True,
+            "url": pr_or_mr_url(mr_result),
+            "iid": mr_result.get("iid") if isinstance(mr_result, dict) else None,
+            "number": mr_result.get("number") if isinstance(mr_result, dict) else None,
+            "raw": mr_result,
+        }
+    if comment_result is not None:
+        payload["comment"] = {"posted": True, "raw": comment_result}
+    elif "comment_issue_completion" in payload["next_actions"]:
+        payload["comment"] = {"posted": False, "reason": f"commentPolicy={workflow.get('commentPolicy')}"}
+    if close_result is not None:
+        payload["close"] = {"performed": True, "raw": close_result}
+    elif "wait_for_merge" in payload["next_actions"] or "do_not_close_before_merge" in payload["next_actions"]:
+        payload["close"] = {"performed": False, "reason": f"autoClose={workflow.get('autoClose')}"}
+    return payload
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -1235,7 +1612,102 @@ def store_token(credential_ref: str, token: str) -> str:
     return str(credentials_file())
 
 
+def cmd_doctor_json(args: argparse.Namespace) -> int:
+    checks: List[Dict[str, Any]] = []
+    next_actions: List[str] = []
+    payload: Dict[str, Any] = {"command": "doctor", "checks": checks, "next_actions": next_actions}
+    ok = True
+
+    if is_git_repo():
+        root = git_root()
+        payload["git"] = {"repository": str(root)}
+        checks.append({"name": "git_repository", "status": "ok", "detail": str(root)})
+    else:
+        checks.append({"name": "git_repository", "status": "fail", "detail": "not inside a git repository"})
+        payload.update({"ok": False, "exit_code": 1})
+        next_actions.append("run_from_git_repository")
+        print_json(payload)
+        return 1
+
+    config_path = root / PROJECT_CONFIG
+    payload["config_path"] = str(config_path)
+    if not config_path.exists():
+        checks.append({"name": "project_config", "status": "fail", "detail": str(config_path)})
+        payload.update({"ok": False, "exit_code": 1})
+        next_actions.append("run_issue_worker_init")
+        print_json(payload)
+        return 1
+    checks.append({"name": "project_config", "status": "ok", "detail": str(config_path)})
+
+    try:
+        config = load_project_config(root)
+        validate_config_shape(config)
+        payload["config"] = {
+            "provider": config.get("provider"),
+            "host": config.get("host"),
+            "repoPath": config.get("repoPath"),
+            "projectId": config.get("projectId"),
+            "defaultBranch": config.get("defaultBranch"),
+            "credentialRef": config.get("credentialRef"),
+        }
+        checks.append({"name": "config_shape", "status": "ok"})
+    except IssueWorkerError as exc:
+        checks.append({"name": "config_shape", "status": "fail", "detail": str(exc)})
+        payload.update({"ok": False, "exit_code": 1})
+        next_actions.append("fix_project_config")
+        print_json(payload)
+        return 1
+
+    matches, detail = validate_project_matches_remote(config)
+    checks.append({"name": "git_remote_match", "status": "ok" if matches else "warn", "detail": detail})
+    if not matches:
+        ok = False
+        next_actions.append("verify_project_config_remote")
+
+    source = token_source(config)
+    token = resolve_token(config, quiet=True)
+    payload["token"] = {"found": bool(token), "source": source}
+    if not token:
+        checks.append({"name": "token", "status": "fail", "detail": "not found"})
+        payload.update(
+            {
+                "ok": False,
+                "exit_code": 1,
+                "token_setup": {
+                    "url": token_creation_url(str(config["provider"]), str(config["host"])),
+                    "command": token_setup_oneliner(),
+                },
+            }
+        )
+        next_actions.append("configure_token")
+        print_json(payload)
+        return 1
+    checks.append({"name": "token", "status": "ok", "detail": source})
+
+    try:
+        adapter = ProviderAdapter(config, token)
+        project = adapter.get_project()
+        label = ""
+        if isinstance(project.data, dict):
+            label = str(project.data.get("full_name") or project.data.get("path_with_namespace") or project.data.get("name") or "")
+        payload["api"] = {"project_lookup": True, "label": label}
+        checks.append({"name": "api_project_lookup", "status": "ok", "detail": label})
+    except IssueWorkerError as exc:
+        checks.append({"name": "api_project_lookup", "status": "fail", "detail": str(exc)})
+        payload.update({"ok": False, "exit_code": 1})
+        next_actions.append("fix_api_access")
+        print_json(payload)
+        return 1
+
+    exit_code = 0 if ok else 2
+    payload.update({"ok": ok, "exit_code": exit_code})
+    print_json(payload)
+    return exit_code
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
+    if getattr(args, "json", False):
+        return cmd_doctor_json(args)
     ok = True
     safe_print("issue-worker doctor")
     if is_git_repo():
@@ -1564,6 +2036,8 @@ def cmd_issues_create(args: argparse.Namespace) -> int:
         die("Issue title is empty.")
     body = read_optional_body_arg(args).strip()
     if not args.confirm:
+        if args.json:
+            die("Creating an issue with --json requires --confirm so stdout remains valid JSON.")
         safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']}")
         safe_print(f"Title: {title}")
         if args.labels:
@@ -1594,6 +2068,8 @@ def cmd_issues_comment(args: argparse.Namespace) -> int:
     if not body.strip():
         die("Comment body is empty.")
     if not args.confirm:
+        if args.json:
+            die("Posting an issue comment with --json requires --confirm so stdout remains valid JSON.")
         safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']} issue #{args.id}")
         if not sys.stdin.isatty():
             die("Posting an issue comment requires --confirm in non-interactive mode.")
@@ -1604,6 +2080,14 @@ def cmd_issues_comment(args: argparse.Namespace) -> int:
     url = ""
     if isinstance(result.data, dict):
         url = str(result.data.get("html_url") or result.data.get("web_url") or "")
+    if args.json:
+        print_json(
+            {
+                "issue": {"id": args.id, "url": issue_link(config, args.id)},
+                "comment": {"posted": True, "url": url, "raw": result.data},
+            }
+        )
+        return 0
     safe_print("Comment posted." + (f" {url}" if url else ""))
     return 0
 
@@ -1612,6 +2096,8 @@ def cmd_issues_close(args: argparse.Namespace) -> int:
     config = load_project_config()
     adapter = adapter_from_config(config)
     if not args.confirm:
+        if args.json:
+            die("Closing an issue with --json requires --confirm so stdout remains valid JSON.")
         safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']} issue #{args.id}")
         if not sys.stdin.isatty():
             die("Closing an issue requires --confirm in non-interactive mode.")
@@ -1623,6 +2109,20 @@ def cmd_issues_close(args: argparse.Namespace) -> int:
     state = ""
     if isinstance(issue, dict):
         state = issue_state(issue)
+    if args.json:
+        print_json(
+            {
+                "issue": {
+                    "id": args.id,
+                    "number": issue_number(adapter.provider, issue) if isinstance(issue, dict) else args.id,
+                    "title": issue_title(issue) if isinstance(issue, dict) else "",
+                    "state": state,
+                    "url": issue_url(issue) if isinstance(issue, dict) else issue_link(config, args.id),
+                },
+                "close": {"performed": True, "raw": issue},
+            }
+        )
+        return 0
     safe_print("Issue closed." + (f" State: {state}" if state else ""))
     return 0
 
@@ -1640,14 +2140,24 @@ def cmd_work_start(args: argparse.Namespace) -> int:
     branch_mode = str(workflow.get("branchMode") or "ask")
     branch = args.branch or derive_branch_name(config, issue, args.id, args.slug)
     base = args.base or str(config.get("defaultBranch") or "main")
-    safe_print(f"Work start guidance for issue #{args.id}")
-    safe_print(f"- Run: issue-worker doctor")
-    safe_print(f"- Read: issue-worker issues get {args.id}")
-    safe_print("- Summarize goal, acceptance criteria, risks, and unclear questions before coding.")
-    safe_print(f"- branchMode is {branch_mode!r}. Recommended branch: {branch}")
+    preflight = build_work_start_preflight(config, branch, base)
+    next_actions = [
+        "summarize_requirements",
+        "create_or_switch_issue_branch" if branch_mode in {"ask", "always"} else "confirm_current_branch",
+    ]
+    branch_result: Optional[Any] = None
+    if not args.json:
+        safe_print(f"Work start guidance for issue #{args.id}")
+        safe_print(f"- Run: issue-worker doctor")
+        safe_print(f"- Read: issue-worker issues get {args.id}")
+        safe_print("- Summarize goal, acceptance criteria, risks, and unclear questions before coding.")
+        safe_print(f"- branchMode is {branch_mode!r}. Recommended branch: {branch}")
+        print_preflight(preflight)
     should_create = not args.local and (args.create_branch or (branch_mode == "always" and not args.no_create_branch))
     if should_create:
         if not args.confirm:
+            if args.json:
+                die("Creating a remote branch with --json requires --confirm so stdout remains valid JSON.")
             safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']} base {base} -> branch {branch}")
             if not sys.stdin.isatty():
                 die("Creating a remote branch requires --confirm in non-interactive mode.")
@@ -1655,15 +2165,33 @@ def cmd_work_start(args: argparse.Namespace) -> int:
                 safe_print("Cancelled.")
                 return 1
         result = adapter.create_branch(base, branch)
-        url = pr_or_mr_url(result.data)
-        safe_print(f"Branch created: {branch}" + (f" {url}" if url else ""))
-    elif branch_mode == "always":
+        branch_result = result.data
+        url = pr_or_mr_url(branch_result)
+        if not args.json:
+            safe_print(f"Branch created: {branch}" + (f" {url}" if url else ""))
+        next_actions.append("switch_to_issue_branch")
+    elif not args.json and branch_mode == "always":
         safe_print(f"- Create branch from {base}: git switch -c {branch}")
-    elif branch_mode == "ask":
+    elif not args.json and branch_mode == "ask":
         safe_print("- Ask the user before creating the branch.")
-    elif branch_mode == "never":
+    elif not args.json and branch_mode == "never":
         safe_print("- Work on the current branch and warn about the risk.")
-    safe_print("- Ask before posting a start-progress issue comment unless project policy allows it.")
+    if not args.json:
+        safe_print("- Ask before posting a start-progress issue comment unless project policy allows it.")
+    if args.json:
+        print_json(
+            command_result_payload(
+                config=config,
+                issue_id=args.id,
+                issue=issue,
+                branch=branch,
+                base=base,
+                workflow=workflow,
+                preflight=preflight,
+                branch_result=branch_result,
+                next_actions=next_actions,
+            )
+        )
     return 0
 
 
@@ -1678,19 +2206,30 @@ def cmd_work_finish(args: argparse.Namespace) -> int:
     workflow = dict(DEFAULT_WORKFLOW)
     workflow.update(config.get("workflow") or {})
     completion_mode = str(workflow.get("completionMode") or "ask")
-    branch = args.branch or run_git(["branch", "--show-current"], check=False) or derive_branch_name(config, issue, args.id, args.slug)
+    branch = args.branch or current_branch() or derive_branch_name(config, issue, args.id, args.slug)
     base = args.base or str(config.get("defaultBranch") or "main")
     title = args.title or default_pr_title(config, issue, args.id)
     body = read_body_arg(args, "Enter PR/MR body.") if (args.body or args.body_file) else build_pr_body(
         config, issue, args.id, include_close=args.close_on_merge
     )
-    safe_print(f"Work finish guidance for issue #{args.id}")
-    safe_print("- Summarize code changes, validation commands, and results.")
-    safe_print("- Comment completion summary before closing the issue.")
-    safe_print(f"- completionMode is {completion_mode!r}.")
+    preflight = build_work_finish_preflight(config, branch, base)
+    mr_result: Optional[Any] = None
+    next_actions = [
+        "comment_issue_completion",
+        "wait_for_merge" if args.create_pr or completion_mode == "mr" else "decide_delivery_mode",
+        "do_not_close_before_merge",
+    ]
+    if not args.json:
+        safe_print(f"Work finish guidance for issue #{args.id}")
+        safe_print("- Summarize code changes, validation commands, and results.")
+        safe_print("- Comment completion summary before closing the issue.")
+        safe_print(f"- completionMode is {completion_mode!r}.")
+        print_preflight(preflight)
     should_create = not args.local and (args.create_pr or (completion_mode == "mr" and not args.no_create_pr))
     if should_create:
         if not args.confirm:
+            if args.json:
+                die("Creating a PR/MR with --json requires --confirm so stdout remains valid JSON.")
             label = pr_or_mr_label(str(config["provider"]))
             safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']} {label} {branch} -> {base}")
             safe_print(f"Title: {title}")
@@ -1703,15 +2242,32 @@ def cmd_work_finish(args: argparse.Namespace) -> int:
                 return 1
         result = adapter.create_pull_or_merge_request(branch, base, title, body)
         label = pr_or_mr_label(str(config["provider"]))
-        url = pr_or_mr_url(result.data)
-        safe_print(f"{label} created." + (f" {url}" if url else ""))
-    elif completion_mode == "mr":
+        mr_result = result.data
+        url = pr_or_mr_url(mr_result)
+        if not args.json:
+            safe_print(f"{label} created." + (f" {url}" if url else ""))
+    elif not args.json and completion_mode == "mr":
         safe_print("- Create a PR/MR when supported and allowed by user/project policy.")
-    elif completion_mode == "direct":
+    elif not args.json and completion_mode == "direct":
         safe_print("- Direct push requires explicit confirmation unless project policy allows it.")
-    else:
+    elif not args.json:
         safe_print("- Ask before pushing, creating PR/MR, or closing the issue.")
-    safe_print("- Do not close before PR/MR merge unless the user explicitly asks.")
+    if not args.json:
+        safe_print("- Do not close before PR/MR merge unless the user explicitly asks.")
+    if args.json:
+        print_json(
+            command_result_payload(
+                config=config,
+                issue_id=args.id,
+                issue=issue,
+                branch=branch,
+                base=base,
+                workflow=workflow,
+                preflight=preflight,
+                mr_result=mr_result,
+                next_actions=next_actions,
+            )
+        )
     return 0
 
 
@@ -1731,6 +2287,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.set_defaults(func=cmd_init)
 
     p_doctor = sub.add_parser("doctor", help="Validate git repo, config, token, and API access.")
+    p_doctor.add_argument("--json", action="store_true", help="Print structured doctor results for agent parsing.")
     p_doctor.set_defaults(func=cmd_doctor)
 
     p_token = sub.add_parser("token", help="Manage local issue-worker tokens.")
@@ -1775,11 +2332,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_comment.add_argument("--body", help="Comment body.")
     p_comment.add_argument("--body-file", help="Read body from file, or '-' for stdin.")
     p_comment.add_argument("--confirm", action="store_true", help="Skip interactive confirmation.")
+    p_comment.add_argument("--json", action="store_true", help="Print structured comment result for agent parsing.")
     p_comment.set_defaults(func=cmd_issues_comment)
 
     p_close = issues_sub.add_parser("close", help="Close an issue.")
     p_close.add_argument("id", help="Issue number/iid/id.")
     p_close.add_argument("--confirm", action="store_true", help="Confirm close operation.")
+    p_close.add_argument("--json", action="store_true", help="Print structured close result for agent parsing.")
     p_close.set_defaults(func=cmd_issues_close)
 
     p_work = sub.add_parser("work", help="Issue workflow helpers.")
@@ -1793,6 +2352,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--no-create-branch", action="store_true", help="Do not auto-create even when branchMode is always.")
     p_start.add_argument("--confirm", action="store_true", help="Confirm branch creation in non-interactive mode.")
     p_start.add_argument("--local", action="store_true", help="Do not call provider APIs; print local guidance only.")
+    p_start.add_argument("--json", action="store_true", help="Print structured start-work result for agent parsing.")
     p_start.set_defaults(func=cmd_work_start)
     p_finish = work_sub.add_parser("finish", help="Print finish-work guidance.")
     p_finish.add_argument("id", help="Issue number/iid/id.")
@@ -1807,6 +2367,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_finish.add_argument("--no-create-pr", action="store_true", help="Do not auto-create even when completionMode is mr.")
     p_finish.add_argument("--confirm", action="store_true", help="Confirm PR/MR creation in non-interactive mode.")
     p_finish.add_argument("--local", action="store_true", help="Do not call provider APIs; print local guidance only.")
+    p_finish.add_argument("--json", action="store_true", help="Print structured finish-work result for agent parsing.")
     p_finish.set_defaults(func=cmd_work_finish)
 
     return parser

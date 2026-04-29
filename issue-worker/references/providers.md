@@ -21,6 +21,14 @@ Adapters should expose these conceptual operations:
 
 The CLI implements provider detection, project lookup, issue list/get/comment/close, token testing, remote branch creation, and PR/MR creation.
 
+CLI-facing issue state values are normalized across providers:
+
+- `open`
+- `closed`
+- `all`
+
+Adapters translate those values before calling provider APIs. For example, GitLab receives `opened` when the user or agent passes `--state open`. Provider-specific values such as GitLab `opened` are also accepted for compatibility, but agent workflows should prefer normalized values.
+
 ## GitHub
 
 - SaaS API base: `https://api.github.com`
@@ -105,6 +113,7 @@ When an API call fails, report:
 - HTTP status code
 - short response message when safe
 - likely causes
+- provider-supported values or a retry suggestion when the failure is a known argument compatibility problem
 
 Common interpretations:
 
@@ -130,3 +139,5 @@ CLI commands:
 issue-worker work start <id> --create-branch --confirm
 issue-worker work finish <id> --create-pr --confirm
 ```
+
+Add `--json` to workflow commands when an agent needs stable result fields instead of human guidance text.
