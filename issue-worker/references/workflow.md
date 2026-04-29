@@ -87,6 +87,8 @@ PR/MR title:
 Fix #{issueId}: {issue title}
 ```
 
+Use the user's language for the title text unless the repository has an explicit English-only convention. Keep required issue references such as `Fix #123`, `Closes #123`, or provider-specific keywords unchanged when they are needed by the platform.
+
 PR/MR body:
 
 - issue link
@@ -107,6 +109,9 @@ If no PR/MR is created and the work is complete, ask whether to close the issue.
 
 ## Communication Style
 
+- Use the user's language for conversation, progress updates, questions, issue comments, PR/MR titles, PR/MR bodies, blocker reports, and completion summaries.
+- Infer the language from the user's latest request and surrounding conversation; do not default to English when the user is using another language.
+- Preserve commands, code identifiers, branch names, API fields, and quoted error output in their original form.
 - Guide new users step by step.
 - Explain token setup without requiring API expertise.
 - Be direct about risky actions: close issue, push, create PR/MR, merge, delete, or exposed token.

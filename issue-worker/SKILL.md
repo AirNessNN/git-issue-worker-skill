@@ -9,6 +9,12 @@ Use this skill when work starts from a repository issue or when the user asks to
 
 This skill is cross-agent: it must work for Codex, OpenCode, Claude Code, Cursor, and other agents. Do not rely on private agent tools. Use the bundled `scripts/issue-worker` CLI and ordinary shell/git commands.
 
+## Interaction Language
+
+Use the user's language for all human-facing interaction. Infer it from the user's latest request and the surrounding conversation. Apply it to status updates, questions, blockers, final summaries, issue comments, PR/MR titles, and PR/MR descriptions. Do not default to English unless the user is using English or the repository has an explicit convention that requires English.
+
+Preserve commands, code identifiers, branch names, commit hashes, API fields, and quoted error output in their original form. If the issue tracker content uses a different language from the user, respond in the user's language while quoting exact issue text only when needed.
+
 ## First Steps
 
 1. Run from the repository root. If the `issue-worker` command is not on `PATH`, invoke the bundled CLI directly:
@@ -124,7 +130,7 @@ Ask before posting a "started work" comment unless project workflow policy expli
   - `direct`: direct push only with explicit confirmation.
   - `ask`: ask before pushing, opening PR/MR, or closing the issue.
 - PR/MR titles should use:
-  - `Fix #{issueId}: {issue title}` for GitHub-style issue references.
+  - the user's language for the title text, with an issue reference such as `Fix #{issueId}: {issue title}` when the project convention uses GitHub-style issue references.
   - an equivalent GitLab/Gitee reference when appropriate.
 - PR/MR descriptions should include issue link, requirement summary, implementation summary, test results, and a `Closes`/`Fixes` statement only when the user wants merge-time auto-close.
 - Do not close an issue before the PR/MR is merged unless the user explicitly asks.
@@ -157,7 +163,7 @@ issue-worker issues list --state open
 issue-worker issues list --state open --limit 20 --json
 issue-worker issues get 123 --json
 issue-worker issues create --title "Bug title" --body "Description" --confirm
-issue-worker issues comment 123 --body "Status update..." --confirm
+issue-worker issues comment 123 --body "进度更新..." --confirm
 issue-worker issues close 123 --confirm
 issue-worker work start 123
 issue-worker work start 123 --create-branch --confirm
