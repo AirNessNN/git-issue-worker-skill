@@ -16,6 +16,11 @@ CLI = ROOT / "issue-worker" / "scripts" / "issue-worker"
 def run_cmd(args, cwd, env=None, input_text=None, check=True):
     merged_env = os.environ.copy()
     merged_env["PYTHONPYCACHEPREFIX"] = tempfile.mkdtemp(prefix="issue-worker-pycache-")
+    merged_env["XDG_CONFIG_HOME"] = tempfile.mkdtemp(prefix="issue-worker-config-")
+    merged_env.pop("ISSUE_WORKER_TOKEN", None)
+    merged_env.pop("GITHUB_TOKEN", None)
+    merged_env.pop("GITLAB_TOKEN", None)
+    merged_env.pop("GITEE_TOKEN", None)
     if env:
         merged_env.update(env)
     proc = subprocess.run(
@@ -439,6 +444,35 @@ class FakeGitLabAgentScenarioTests(unittest.TestCase):
                     input_text=FakeGitLabHandler.token + "\n",
                 )
                 self.assertIn("Token saved", proc.stdout)
+                self.assertIn("[ok] project access", proc.stdout)
+
+    def test_fallback_token_wins_when_git_credential_helper_would_prompt(self):
+        with FakeGitLabServer() as server:
+            tmp, repo = init_git_repo("git@git.arlth.cn:huhw/issue-test.git")
+            with tmp:
+                write_project_config(repo, server.url)
+                xdg_home = tempfile.mkdtemp(prefix="issue-worker-config-")
+                helper = Path(xdg_home) / "prompting-helper.sh"
+                helper.write_text(
+                    "#!/bin/sh\n"
+                    "if [ \"$GIT_TERMINAL_PROMPT\" != \"0\" ]; then\n"
+                    "  echo password=wrong-token\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "exit 1\n",
+                    encoding="utf-8",
+                )
+                helper.chmod(0o700)
+                git(["config", "credential.helper", str(helper)], repo)
+                run_cmd(
+                    ["token", "set", "--from-stdin"],
+                    repo,
+                    env={"XDG_CONFIG_HOME": xdg_home},
+                    input_text=FakeGitLabHandler.token + "\n",
+                )
+
+                proc = run_cmd(["token", "test"], repo, env={"XDG_CONFIG_HOME": xdg_home})
+
                 self.assertIn("[ok] project access", proc.stdout)
 
 

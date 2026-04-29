@@ -351,16 +351,24 @@ def env_token(provider: str) -> Optional[str]:
     return None
 
 
+def credential_env_no_prompt() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GCM_INTERACTIVE"] = "never"
+    return env
+
+
 def credential_fill(provider: str, host: str, username: str) -> Optional[str]:
     protocol = provider
     payload = f"protocol={protocol}\nhost={host}\nusername={username}\n\n"
     try:
         proc = subprocess.run(
-            ["git", "credential", "fill"],
+            ["git", "-c", "credential.interactive=false", "credential", "fill"],
             input=payload,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=credential_env_no_prompt(),
             check=False,
         )
     except FileNotFoundError:
@@ -378,11 +386,12 @@ def credential_approve(provider: str, host: str, username: str, token: str) -> b
     payload = f"protocol={provider}\nhost={host}\nusername={username}\npassword={token}\n\n"
     try:
         proc = subprocess.run(
-            ["git", "credential", "approve"],
+            ["git", "-c", "credential.interactive=false", "credential", "approve"],
             input=payload,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=credential_env_no_prompt(),
             check=False,
         )
     except FileNotFoundError:
@@ -394,11 +403,12 @@ def credential_reject(provider: str, host: str, username: str) -> bool:
     payload = f"protocol={provider}\nhost={host}\nusername={username}\n\n"
     try:
         proc = subprocess.run(
-            ["git", "credential", "reject"],
+            ["git", "-c", "credential.interactive=false", "credential", "reject"],
             input=payload,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            env=credential_env_no_prompt(),
             check=False,
         )
     except FileNotFoundError:
@@ -486,10 +496,10 @@ def resolve_token(config: Dict[str, Any], quiet: bool = False) -> Optional[str]:
         if not quiet:
             raise
         return None
-    token = credential_fill(ref_provider, host, username)
+    token = fallback_get(ref)
     if token:
         return token
-    token = fallback_get(ref)
+    token = credential_fill(ref_provider, host, username)
     if token:
         return token
     return None
@@ -504,10 +514,10 @@ def token_source(config: Dict[str, Any]) -> str:
         ref_provider, host, username = parse_credential_ref(ref)
     except IssueWorkerError:
         return "invalid credentialRef"
-    if credential_fill(ref_provider, host, username):
-        return "git credential"
     if fallback_get(ref):
         return str(credentials_file())
+    if credential_fill(ref_provider, host, username):
+        return "git credential"
     return "not found"
 
 
