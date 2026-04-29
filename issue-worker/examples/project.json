@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "provider": "gitlab",
+  "host": "git.arlth.cn",
+  "apiBaseUrl": "https://git.arlth.cn/api/v4",
+  "repoPath": "v7/biz-framework",
+  "projectId": 1093,
+  "defaultBranch": "main",
+  "credentialRef": "gitlab://git.arlth.cn/huhw",
+  "workflow": {
+    "branchMode": "ask",
+    "branchPrefix": "issue/",
+    "completionMode": "ask",
+    "autoClose": "after_merge_or_confirm",
+    "commentPolicy": "progress_blocker_done"
+  }
+}

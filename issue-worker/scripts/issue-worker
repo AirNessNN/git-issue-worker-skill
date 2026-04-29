@@ -1,0 +1,1740 @@
+#!/usr/bin/env python3
+"""
+Cross-agent issue worker CLI.
+
+This script intentionally uses only the Python standard library so it can run
+from Codex, OpenCode, Claude Code, Cursor, local terminals, and CI shells.
+"""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import textwrap
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+APP_NAME = "issue-worker"
+PROJECT_CONFIG = ".issue-worker/project.json"
+SUPPORTED_PROVIDERS = {"github", "gitlab", "gitee"}
+DEFAULT_PER_PAGE = 100
+DEFAULT_LIST_LIMIT = 100
+DEFAULT_COMMENTS_LIMIT = 200
+DEFAULT_WORKFLOW = {
+    "branchMode": "ask",
+    "branchPrefix": "issue/",
+    "completionMode": "ask",
+    "autoClose": "after_merge_or_confirm",
+    "commentPolicy": "progress_blocker_done",
+}
+
+
+class IssueWorkerError(Exception):
+    """Expected user-facing error."""
+
+
+@dataclass
+class ApiResult:
+    status: int
+    data: Any
+    headers: Dict[str, str]
+
+
+def eprint(message: str = "") -> None:
+    print(message, file=sys.stderr)
+
+
+def die(message: str, code: int = 1) -> None:
+    raise IssueWorkerError(message)
+
+
+def safe_print(message: str = "") -> None:
+    try:
+        print(message)
+    except BrokenPipeError:
+        raise SystemExit(0)
+
+
+def run_git(args: List[str], cwd: Optional[Path] = None, check: bool = True) -> str:
+    try:
+        proc = subprocess.run(
+            ["git"] + args,
+            cwd=str(cwd) if cwd else None,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        die("git is required but was not found on PATH.")
+    if check and proc.returncode != 0:
+        msg = proc.stderr.strip() or proc.stdout.strip() or "git command failed"
+        die(f"git {' '.join(args)} failed: {msg}")
+    return proc.stdout.strip()
+
+
+def git_root() -> Path:
+    output = run_git(["rev-parse", "--show-toplevel"])
+    if not output:
+        die("Current directory is not inside a git repository.")
+    return Path(output).resolve()
+
+
+def is_git_repo() -> bool:
+    try:
+        run_git(["rev-parse", "--show-toplevel"], check=True)
+        return True
+    except IssueWorkerError:
+        return False
+
+
+def load_project_config(root: Optional[Path] = None) -> Dict[str, Any]:
+    root = root or git_root()
+    path = root / PROJECT_CONFIG
+    if not path.exists():
+        die(
+            f"Missing {PROJECT_CONFIG}. Run `issue-worker init` from the repository root "
+            "or create the project config first."
+        )
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError as exc:
+        die(f"Invalid JSON in {path}: {exc}")
+    return data
+
+
+def write_project_config(config: Dict[str, Any], root: Optional[Path] = None) -> Path:
+    root = root or git_root()
+    path = root / PROJECT_CONFIG
+    path.parent.mkdir(parents=True, exist_ok=True)
+    clean = json.loads(json.dumps(config))
+    text = json.dumps(clean, indent=2, ensure_ascii=False) + "\n"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def prompt(message: str, default: Optional[str] = None, required: bool = True) -> str:
+    suffix = f" [{default}]" if default is not None and default != "" else ""
+    if not sys.stdin.isatty():
+        if default is not None:
+            return default
+        if not required:
+            return ""
+        die(f"{message} is required in non-interactive mode. Pass the matching CLI option.")
+    while True:
+        try:
+            value = input(f"{message}{suffix}: ").strip()
+        except EOFError:
+            if default is not None:
+                return default
+            die(f"{message} is required.")
+        if value:
+            return value
+        if default is not None:
+            return default
+        if not required:
+            return ""
+        safe_print("A value is required.")
+
+
+def confirm(message: str, default: bool = False) -> bool:
+    suffix = " [Y/n]" if default else " [y/N]"
+    if not sys.stdin.isatty():
+        return default
+    while True:
+        try:
+            value = input(f"{message}{suffix}: ").strip().lower()
+        except EOFError:
+            return default
+        if not value:
+            return default
+        if value in {"y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        safe_print("Please answer y or n.")
+
+
+def choose(label: str, values: List[str], default: Optional[str] = None) -> str:
+    if not values:
+        die(f"No {label} candidates found.")
+    if len(values) == 1:
+        return values[0]
+    safe_print(f"Multiple {label} candidates found:")
+    for idx, value in enumerate(values, start=1):
+        marker = " (default)" if value == default else ""
+        safe_print(f"  {idx}. {value}{marker}")
+    if not sys.stdin.isatty():
+        if default in values:
+            safe_print(f"Non-interactive mode: using default {label} {default}.")
+            return str(default)
+        die(f"Multiple {label} candidates found. Pass the matching CLI option.")
+    while True:
+        try:
+            answer = input(f"Choose {label} number: ").strip()
+        except EOFError:
+            if default in values:
+                return str(default)
+            die(f"Multiple {label} candidates found. Pass the matching CLI option.")
+        if not answer and default in values:
+            return str(default)
+        if answer.isdigit():
+            idx = int(answer)
+            if 1 <= idx <= len(values):
+                return values[idx - 1]
+        safe_print("Invalid choice.")
+
+
+def get_remotes() -> Dict[str, str]:
+    output = run_git(["remote", "-v"], check=True)
+    remotes: Dict[str, str] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] == "(fetch)":
+            remotes[parts[0]] = parts[1]
+    return remotes
+
+
+def get_default_branch() -> str:
+    symbolic = run_git(["symbolic-ref", "refs/remotes/origin/HEAD"], check=False)
+    if symbolic:
+        return symbolic.rsplit("/", 1)[-1]
+    current = run_git(["branch", "--show-current"], check=False)
+    return current or "main"
+
+
+def strip_dot_git(path: str) -> str:
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return path
+
+
+def quote_segment(value: Any) -> str:
+    return urllib.parse.quote(str(value), safe="")
+
+
+def quote_repo_path(repo_path: str) -> str:
+    return "/".join(quote_segment(part) for part in repo_path.strip("/").split("/") if part)
+
+
+def split_owner_repo(repo_path: str) -> Tuple[str, str]:
+    parts = repo_path.strip("/").split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        die(f"Expected repository path in owner/repo form, got: {repo_path}")
+    return quote_segment(parts[0]), quote_segment(parts[1])
+
+
+def slugify(value: str, max_length: int = 48) -> str:
+    value = value.lower()
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = value.strip("-")
+    return (value[:max_length].strip("-") or "issue")
+
+
+def split_csv(value: str) -> List[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_remote_url(url: str) -> Tuple[str, str]:
+    """Return (host, repo_path) from common git remote URL shapes."""
+    scp_like = re.match(r"^(?:[^@]+@)?([^:]+):(.+)$", url)
+    if scp_like and "://" not in url:
+        return scp_like.group(1).lower(), strip_dot_git(scp_like.group(2))
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme and parsed.netloc:
+        host = parsed.hostname or parsed.netloc
+        return host.lower(), strip_dot_git(parsed.path)
+
+    die(f"Cannot parse git remote URL: {url}")
+
+
+def detect_static_provider(host: str) -> Optional[str]:
+    normalized = host.lower()
+    if normalized == "github.com":
+        return "github"
+    if normalized == "gitlab.com":
+        return "gitlab"
+    if normalized == "gitee.com":
+        return "gitee"
+    return None
+
+
+def default_api_base(provider: str, host: str) -> str:
+    if provider == "github":
+        return "https://api.github.com"
+    if provider == "gitlab":
+        return "https://gitlab.com/api/v4" if host == "gitlab.com" else f"https://{host}/api/v4"
+    if provider == "gitee":
+        return "https://gitee.com/api/v5"
+    die(f"Unsupported provider: {provider}")
+
+
+def probe_gitlab(host: str, timeout: int = 8) -> bool:
+    url = f"https://{host}/api/v4/version"
+    req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def parse_credential_ref(ref: str) -> Tuple[str, str, str]:
+    parsed = urllib.parse.urlparse(ref)
+    provider = parsed.scheme
+    host = parsed.hostname or parsed.netloc
+    username = parsed.path.lstrip("/")
+    if provider not in SUPPORTED_PROVIDERS or not host or not username:
+        die(
+            "Invalid credentialRef. Expected {provider}://{host}/{username}, "
+            "for example gitlab://git.arlth.cn/huhw."
+        )
+    return provider, host, username
+
+
+def make_credential_ref(provider: str, host: str, username: str) -> str:
+    return f"{provider}://{host}/{username}"
+
+
+def env_token(provider: str) -> Optional[str]:
+    names = ["ISSUE_WORKER_TOKEN"]
+    if provider == "github":
+        names.append("GITHUB_TOKEN")
+    elif provider == "gitlab":
+        names.append("GITLAB_TOKEN")
+    elif provider == "gitee":
+        names.append("GITEE_TOKEN")
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def credential_fill(provider: str, host: str, username: str) -> Optional[str]:
+    protocol = provider
+    payload = f"protocol={protocol}\nhost={host}\nusername={username}\n\n"
+    try:
+        proc = subprocess.run(
+            ["git", "credential", "fill"],
+            input=payload,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("password="):
+            token = line.split("=", 1)[1]
+            return token or None
+    return None
+
+
+def credential_approve(provider: str, host: str, username: str, token: str) -> bool:
+    payload = f"protocol={provider}\nhost={host}\nusername={username}\npassword={token}\n\n"
+    try:
+        proc = subprocess.run(
+            ["git", "credential", "approve"],
+            input=payload,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False
+    return proc.returncode == 0
+
+
+def credential_reject(provider: str, host: str, username: str) -> bool:
+    payload = f"protocol={provider}\nhost={host}\nusername={username}\n\n"
+    try:
+        proc = subprocess.run(
+            ["git", "credential", "reject"],
+            input=payload,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except FileNotFoundError:
+        return False
+    return proc.returncode == 0
+
+
+def config_home() -> Path:
+    if os.name == "nt" and os.environ.get("APPDATA"):
+        return Path(os.environ["APPDATA"]) / APP_NAME
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if base:
+        return Path(base) / APP_NAME
+    return Path.home() / ".config" / APP_NAME
+
+
+def credentials_file() -> Path:
+    return config_home() / "credentials.json"
+
+
+def load_fallback_credentials() -> Dict[str, str]:
+    path = credentials_file()
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except json.JSONDecodeError:
+        die(f"Invalid fallback credentials file: {path}")
+    if not isinstance(data, dict):
+        die(f"Fallback credentials file must contain a JSON object: {path}")
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def save_fallback_credentials(data: Dict[str, str]) -> None:
+    path = credentials_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+        fh.write("\n")
+    try:
+        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+    tmp.replace(path)
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    except OSError:
+        pass
+
+
+def fallback_get(ref: str) -> Optional[str]:
+    return load_fallback_credentials().get(ref)
+
+
+def fallback_set(ref: str, token: str) -> None:
+    data = load_fallback_credentials()
+    data[ref] = token
+    save_fallback_credentials(data)
+
+
+def fallback_remove(ref: str) -> bool:
+    data = load_fallback_credentials()
+    if ref not in data:
+        return False
+    del data[ref]
+    save_fallback_credentials(data)
+    return True
+
+
+def resolve_token(config: Dict[str, Any], quiet: bool = False) -> Optional[str]:
+    provider = str(config.get("provider", ""))
+    ref = str(config.get("credentialRef", ""))
+    if not provider or not ref:
+        if not quiet:
+            eprint("Project config is missing provider or credentialRef.")
+        return None
+    token = env_token(provider)
+    if token:
+        return token
+    try:
+        ref_provider, host, username = parse_credential_ref(ref)
+    except IssueWorkerError:
+        if not quiet:
+            raise
+        return None
+    token = credential_fill(ref_provider, host, username)
+    if token:
+        return token
+    token = fallback_get(ref)
+    if token:
+        return token
+    return None
+
+
+def token_source(config: Dict[str, Any]) -> str:
+    provider = str(config.get("provider", ""))
+    if env_token(provider):
+        return "environment override"
+    ref = str(config.get("credentialRef", ""))
+    try:
+        ref_provider, host, username = parse_credential_ref(ref)
+    except IssueWorkerError:
+        return "invalid credentialRef"
+    if credential_fill(ref_provider, host, username):
+        return "git credential"
+    if fallback_get(ref):
+        return str(credentials_file())
+    return "not found"
+
+
+class ProviderAdapter:
+    def __init__(self, config: Dict[str, Any], token: Optional[str]) -> None:
+        self.config = config
+        self.provider = str(config["provider"])
+        self.host = str(config["host"])
+        self.api_base = str(config["apiBaseUrl"]).rstrip("/")
+        self.repo_path = str(config.get("repoPath", ""))
+        self.project_id = config.get("projectId") or self.repo_path
+        self.default_branch = str(config.get("defaultBranch") or "main")
+        self.token = token
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: Optional[Dict[str, Any]] = None,
+        body: Optional[Any] = None,
+        endpoint_type: str,
+    ) -> ApiResult:
+        query = {k: v for k, v in (query or {}).items() if v is not None and v != ""}
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": APP_NAME,
+        }
+        data: Optional[bytes] = None
+        if self.provider == "github":
+            headers["X-GitHub-Api-Version"] = "2022-11-28"
+            if self.token:
+                headers["Authorization"] = f"Bearer {self.token}"
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                data = json.dumps(body).encode("utf-8")
+        elif self.provider == "gitlab":
+            if self.token:
+                headers["PRIVATE-TOKEN"] = self.token
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+                data = json.dumps(body).encode("utf-8")
+        elif self.provider == "gitee":
+            if self.token:
+                query["access_token"] = self.token
+            if body is not None:
+                if isinstance(body, dict):
+                    if self.token:
+                        body = dict(body)
+                        body["access_token"] = self.token
+                    data = urllib.parse.urlencode(body).encode("utf-8")
+                    headers["Content-Type"] = "application/x-www-form-urlencoded"
+                else:
+                    data = body
+        else:
+            die(f"Unsupported provider: {self.provider}")
+
+        url = self.api_base + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query, doseq=True)
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read()
+                parsed = parse_response_body(raw)
+                return ApiResult(resp.status, parsed, dict(resp.headers.items()))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()
+            parsed = parse_response_body(raw)
+            raise_api_error(self.provider, self.host, endpoint_type, exc.code, parsed)
+        except urllib.error.URLError as exc:
+            die(
+                f"{self.provider} {self.host} {endpoint_type} request failed before HTTP response: "
+                f"{exc.reason}"
+            )
+
+    def project_key(self) -> str:
+        if self.provider == "gitlab":
+            return urllib.parse.quote(str(self.project_id), safe="")
+        return self.repo_path
+
+    def repo_api_path(self) -> str:
+        if self.provider == "gitlab":
+            return self.project_key()
+        return quote_repo_path(self.repo_path)
+
+    def owner_repo_api_path(self) -> str:
+        owner, repo = split_owner_repo(self.repo_path)
+        return f"{owner}/{repo}"
+
+    def paginate(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: Optional[Dict[str, Any]] = None,
+        endpoint_type: str,
+        limit: Optional[int] = None,
+    ) -> List[Any]:
+        query = dict(query or {})
+        items: List[Any] = []
+        if self.provider in {"github", "gitee"}:
+            page = 1
+            per_page = min(limit or DEFAULT_PER_PAGE, DEFAULT_PER_PAGE)
+            while True:
+                page_query = dict(query)
+                page_query.update({"page": page, "per_page": per_page})
+                result = self.request(method, path, query=page_query, endpoint_type=endpoint_type)
+                if not isinstance(result.data, list):
+                    return items or [result.data]
+                items.extend(result.data)
+                if limit and len(items) >= limit:
+                    return items[:limit]
+                if len(result.data) < per_page:
+                    return items
+                page += 1
+        if self.provider == "gitlab":
+            page = 1
+            per_page = min(limit or DEFAULT_PER_PAGE, DEFAULT_PER_PAGE)
+            while True:
+                page_query = dict(query)
+                page_query.update({"page": page, "per_page": per_page})
+                result = self.request(method, path, query=page_query, endpoint_type=endpoint_type)
+                if not isinstance(result.data, list):
+                    return items or [result.data]
+                items.extend(result.data)
+                if limit and len(items) >= limit:
+                    return items[:limit]
+                next_page = result.headers.get("X-Next-Page") or result.headers.get("x-next-page")
+                if not next_page:
+                    return items
+                page = int(next_page)
+        return items
+
+    def get_project(self) -> ApiResult:
+        if self.provider == "github":
+            return self.request("GET", f"/repos/{self.owner_repo_api_path()}", endpoint_type="project lookup")
+        if self.provider == "gitlab":
+            return self.request("GET", f"/projects/{self.project_key()}", endpoint_type="project lookup")
+        if self.provider == "gitee":
+            return self.request("GET", f"/repos/{self.owner_repo_api_path()}", endpoint_type="project lookup")
+        die(f"Unsupported provider: {self.provider}")
+
+    def get_current_user(self) -> ApiResult:
+        return self.request("GET", "/user", endpoint_type="current user")
+
+    def list_issues(
+        self,
+        state: Optional[str] = None,
+        labels: Optional[str] = None,
+        assignee: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> List[Any]:
+        query: Dict[str, Any] = {}
+        if state:
+            query["state"] = normalize_state_for_provider(self.provider, state)
+        if labels:
+            query["labels"] = labels
+        if assignee:
+            query["assignee"] = assignee
+        if self.provider == "github":
+            return self.paginate(
+                "GET",
+                f"/repos/{self.owner_repo_api_path()}/issues",
+                query=query,
+                endpoint_type="issue list",
+                limit=limit,
+            )
+        if self.provider == "gitlab":
+            return self.paginate(
+                "GET",
+                f"/projects/{self.project_key()}/issues",
+                query=query,
+                endpoint_type="issue list",
+                limit=limit,
+            )
+        if self.provider == "gitee":
+            return self.paginate(
+                "GET",
+                f"/repos/{self.owner_repo_api_path()}/issues",
+                query=query,
+                endpoint_type="issue list",
+                limit=limit,
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+    def get_issue(self, issue_id: str) -> ApiResult:
+        if self.provider == "github":
+            return self.request(
+                "GET",
+                f"/repos/{self.owner_repo_api_path()}/issues/{quote_segment(issue_id)}",
+                endpoint_type="issue get",
+            )
+        if self.provider == "gitlab":
+            return self.request(
+                "GET",
+                f"/projects/{self.project_key()}/issues/{quote_segment(issue_id)}",
+                endpoint_type="issue get",
+            )
+        if self.provider == "gitee":
+            return self.request(
+                "GET",
+                f"/repos/{self.owner_repo_api_path()}/issues/{quote_segment(issue_id)}",
+                endpoint_type="issue get",
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+    def create_issue(self, title: str, body: str = "", labels: Optional[str] = None) -> ApiResult:
+        if self.provider == "github":
+            payload: Dict[str, Any] = {"title": title}
+            if body:
+                payload["body"] = body
+            if labels:
+                payload["labels"] = split_csv(labels)
+            return self.request(
+                "POST",
+                f"/repos/{self.owner_repo_api_path()}/issues",
+                body=payload,
+                endpoint_type="issue create",
+            )
+        if self.provider == "gitlab":
+            payload = {"title": title}
+            if body:
+                payload["description"] = body
+            if labels:
+                payload["labels"] = labels
+            return self.request(
+                "POST",
+                f"/projects/{self.project_key()}/issues",
+                body=payload,
+                endpoint_type="issue create",
+            )
+        if self.provider == "gitee":
+            payload = {"title": title}
+            if body:
+                payload["body"] = body
+            if labels:
+                payload["labels"] = labels
+            return self.request(
+                "POST",
+                f"/repos/{self.owner_repo_api_path()}/issues",
+                body=payload,
+                endpoint_type="issue create",
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+    def list_comments(self, issue_id: str, limit: Optional[int] = None) -> List[Any]:
+        if self.provider == "github":
+            return self.paginate(
+                "GET",
+                f"/repos/{self.owner_repo_api_path()}/issues/{quote_segment(issue_id)}/comments",
+                endpoint_type="issue comments",
+                limit=limit,
+            )
+        if self.provider == "gitlab":
+            return self.paginate(
+                "GET",
+                f"/projects/{self.project_key()}/issues/{quote_segment(issue_id)}/notes",
+                endpoint_type="issue comments",
+                limit=limit,
+            )
+        if self.provider == "gitee":
+            return self.paginate(
+                "GET",
+                f"/repos/{self.owner_repo_api_path()}/issues/{quote_segment(issue_id)}/comments",
+                endpoint_type="issue comments",
+                limit=limit,
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+    def create_comment(self, issue_id: str, body: str) -> ApiResult:
+        if self.provider == "github":
+            return self.request(
+                "POST",
+                f"/repos/{self.owner_repo_api_path()}/issues/{quote_segment(issue_id)}/comments",
+                body={"body": body},
+                endpoint_type="issue comment create",
+            )
+        if self.provider == "gitlab":
+            return self.request(
+                "POST",
+                f"/projects/{self.project_key()}/issues/{quote_segment(issue_id)}/notes",
+                body={"body": body},
+                endpoint_type="issue comment create",
+            )
+        if self.provider == "gitee":
+            return self.request(
+                "POST",
+                f"/repos/{self.owner_repo_api_path()}/issues/{quote_segment(issue_id)}/comments",
+                body={"body": body},
+                endpoint_type="issue comment create",
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+    def close_issue(self, issue_id: str) -> ApiResult:
+        if self.provider == "github":
+            return self.request(
+                "PATCH",
+                f"/repos/{self.owner_repo_api_path()}/issues/{quote_segment(issue_id)}",
+                body={"state": "closed"},
+                endpoint_type="issue close",
+            )
+        if self.provider == "gitlab":
+            return self.request(
+                "PUT",
+                f"/projects/{self.project_key()}/issues/{quote_segment(issue_id)}",
+                body={"state_event": "close"},
+                endpoint_type="issue close",
+            )
+        if self.provider == "gitee":
+            return self.request(
+                "PATCH",
+                f"/repos/{self.owner_repo_api_path()}/issues/{quote_segment(issue_id)}",
+                body={"state": "closed"},
+                endpoint_type="issue close",
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+    def get_branch(self, branch: str) -> ApiResult:
+        if self.provider == "github":
+            return self.request(
+                "GET",
+                f"/repos/{self.owner_repo_api_path()}/git/ref/heads/{quote_repo_path(branch)}",
+                endpoint_type="branch lookup",
+            )
+        if self.provider == "gitlab":
+            return self.request(
+                "GET",
+                f"/projects/{self.project_key()}/repository/branches/{quote_segment(branch)}",
+                endpoint_type="branch lookup",
+            )
+        if self.provider == "gitee":
+            return self.request(
+                "GET",
+                f"/repos/{self.owner_repo_api_path()}/branches/{quote_segment(branch)}",
+                endpoint_type="branch lookup",
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+    def create_branch(self, base: str, branch: str) -> ApiResult:
+        if self.provider == "github":
+            base_ref = self.get_branch(base).data
+            sha = None
+            if isinstance(base_ref, dict):
+                obj = base_ref.get("object")
+                if isinstance(obj, dict):
+                    sha = obj.get("sha")
+            if not sha:
+                die("GitHub branch create failed: could not resolve base branch SHA.")
+            return self.request(
+                "POST",
+                f"/repos/{self.owner_repo_api_path()}/git/refs",
+                body={"ref": f"refs/heads/{branch}", "sha": sha},
+                endpoint_type="branch create",
+            )
+        if self.provider == "gitlab":
+            return self.request(
+                "POST",
+                f"/projects/{self.project_key()}/repository/branches",
+                body={"branch": branch, "ref": base},
+                endpoint_type="branch create",
+            )
+        if self.provider == "gitee":
+            return self.request(
+                "POST",
+                f"/repos/{self.owner_repo_api_path()}/branches",
+                body={"refs": base, "branch_name": branch},
+                endpoint_type="branch create",
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+    def create_pull_or_merge_request(self, branch: str, base: str, title: str, body: str) -> ApiResult:
+        if self.provider == "github":
+            return self.request(
+                "POST",
+                f"/repos/{self.owner_repo_api_path()}/pulls",
+                body={"head": branch, "base": base, "title": title, "body": body},
+                endpoint_type="pull request create",
+            )
+        if self.provider == "gitlab":
+            return self.request(
+                "POST",
+                f"/projects/{self.project_key()}/merge_requests",
+                body={"source_branch": branch, "target_branch": base, "title": title, "description": body},
+                endpoint_type="merge request create",
+            )
+        if self.provider == "gitee":
+            return self.request(
+                "POST",
+                f"/repos/{self.owner_repo_api_path()}/pulls",
+                body={"head": branch, "base": base, "title": title, "body": body},
+                endpoint_type="pull request create",
+            )
+        die(f"Unsupported provider: {self.provider}")
+
+
+def parse_response_body(raw: bytes) -> Any:
+    if not raw:
+        return None
+    text = raw.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def safe_error_message(data: Any) -> str:
+    if data is None:
+        return ""
+    if isinstance(data, dict):
+        for key in ("message", "error", "error_description"):
+            if key in data:
+                value = data[key]
+                if isinstance(value, (list, dict)):
+                    return json.dumps(value, ensure_ascii=False)
+                return str(value)
+        return json.dumps(data, ensure_ascii=False)[:500]
+    if isinstance(data, list):
+        return json.dumps(data, ensure_ascii=False)[:500]
+    return str(data)[:500]
+
+
+def raise_api_error(provider: str, host: str, endpoint_type: str, status: int, data: Any) -> None:
+    message = safe_error_message(data)
+    hints = status_hints(provider, status)
+    text = (
+        f"{provider} {host} {endpoint_type} failed: HTTP {status}"
+        + (f" - {message}" if message else "")
+        + (f"\nLikely causes: {hints}" if hints else "")
+    )
+    die(text)
+
+
+def status_hints(provider: str, status: int) -> str:
+    if status == 401:
+        return "token is missing, expired, revoked, malformed, or the auth method is wrong."
+    if status == 403:
+        return "token lacks required scope, the account lacks project permission, or provider policy blocked the operation."
+    if status == 404:
+        if provider == "gitlab":
+            return (
+                "project/issue not found, token has no access and GitLab hides the private project, "
+                "or project path was not URL-encoded correctly."
+            )
+        return "repo/issue not found, token has no access, or the repository path is wrong."
+    if status == 422:
+        return "provider validation failed, the state transition is invalid, or request fields are not accepted."
+    if status == 429:
+        return "rate limit exceeded."
+    return ""
+
+
+def normalize_state_for_provider(provider: str, state: str) -> str:
+    state = state.lower()
+    if provider == "gitlab" and state == "closed":
+        return "closed"
+    return state
+
+
+def adapter_from_config(config: Dict[str, Any], require_token: bool = True) -> ProviderAdapter:
+    validate_config_shape(config)
+    token = resolve_token(config)
+    if require_token and not token:
+        die(
+            "No token found. Use `issue-worker token set`, configure git credential, "
+            "or set a temporary ISSUE_WORKER_TOKEN/provider token environment variable."
+        )
+    return ProviderAdapter(config, token)
+
+
+def validate_config_shape(config: Dict[str, Any]) -> None:
+    required = ["provider", "host", "apiBaseUrl", "repoPath", "credentialRef"]
+    missing = [name for name in required if not config.get(name)]
+    if missing:
+        die(f"Project config is missing required fields: {', '.join(missing)}")
+    provider = str(config["provider"])
+    if provider not in SUPPORTED_PROVIDERS:
+        die(f"Unsupported provider in project config: {provider}")
+    parse_credential_ref(str(config["credentialRef"]))
+    if contains_secret_key(config):
+        die(f"{PROJECT_CONFIG} appears to contain token-like fields. Remove secrets from project config.")
+
+
+def contains_secret_key(value: Any) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            lowered = str(key).lower()
+            if "token" in lowered or lowered in {"access_token", "password", "secret"}:
+                return True
+            if contains_secret_key(nested):
+                return True
+    elif isinstance(value, list):
+        return any(contains_secret_key(item) for item in value)
+    return False
+
+
+def provider_current_user(config: Dict[str, Any], token: str) -> Optional[str]:
+    adapter = ProviderAdapter(config, token)
+    try:
+        if adapter.provider in {"github", "gitlab", "gitee"}:
+            result = adapter.get_current_user()
+            if isinstance(result.data, dict):
+                return str(result.data.get("login") or result.data.get("username") or result.data.get("name") or "")
+    except IssueWorkerError:
+        return None
+    return None
+
+
+def get_gitlab_project_id(config: Dict[str, Any], token: Optional[str]) -> Optional[int]:
+    if not token:
+        return None
+    adapter = ProviderAdapter(config, token)
+    try:
+        result = adapter.get_project()
+    except IssueWorkerError:
+        return None
+    if isinstance(result.data, dict) and isinstance(result.data.get("id"), int):
+        return int(result.data["id"])
+    return None
+
+
+def validate_project_matches_remote(config: Dict[str, Any]) -> Tuple[bool, str]:
+    remotes = get_remotes()
+    if not remotes:
+        return False, "no git remotes configured"
+    matches = []
+    for name, url in remotes.items():
+        try:
+            host, repo_path = parse_remote_url(url)
+        except IssueWorkerError:
+            continue
+        if host == config.get("host") and repo_path == config.get("repoPath"):
+            matches.append(name)
+    if matches:
+        return True, ", ".join(matches)
+    return False, f"no remote matches host={config.get('host')} repoPath={config.get('repoPath')}"
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    if not is_git_repo():
+        die("Current directory is not inside a git repository.")
+    root = git_root()
+    remotes = get_remotes()
+    if not remotes:
+        die("No git remotes found. Add a remote before running init.")
+
+    remote_name = args.remote
+    if not remote_name:
+        remote_names = list(remotes.keys())
+        if len(remote_names) == 1:
+            remote_name = remote_names[0]
+        else:
+            remote_name = choose("remote", remote_names, default="origin" if "origin" in remotes else None)
+    elif remote_name not in remotes:
+        die(f"Remote {remote_name!r} not found. Available remotes: {', '.join(remotes)}")
+
+    remote_url = remotes[remote_name]
+    host, repo_path = parse_remote_url(remote_url)
+    provider = args.provider or detect_static_provider(host)
+    if not provider and probe_gitlab(host):
+        provider = "gitlab"
+    if not provider:
+        provider = prompt("Provider could not be detected. Enter provider (github/gitlab/gitee)")
+    provider = provider.lower()
+    if provider not in SUPPORTED_PROVIDERS:
+        die(f"Unsupported provider: {provider}")
+
+    api_base = args.api_base_url or default_api_base(provider, host)
+    username_default = os.environ.get("USER") or os.environ.get("USERNAME") or ""
+    username = args.username or prompt("Credential username", username_default or None)
+    credential_ref = make_credential_ref(provider, host, username)
+
+    config: Dict[str, Any] = {
+        "version": 1,
+        "provider": provider,
+        "host": host,
+        "apiBaseUrl": api_base,
+        "repoPath": repo_path,
+        "projectId": repo_path,
+        "defaultBranch": args.default_branch or get_default_branch(),
+        "credentialRef": credential_ref,
+        "workflow": dict(DEFAULT_WORKFLOW),
+    }
+
+    token = resolve_token(config, quiet=True)
+    if not token:
+        print_token_guidance(provider)
+        safe_print()
+        safe_print(f"No token found for {credential_ref}.")
+        if sys.stdin.isatty() and confirm("Set a token now using hidden input?", default=True):
+            token = getpass.getpass("Token: ").strip()
+            if not token:
+                die("No token entered.")
+            store_token(credential_ref, token)
+        else:
+            safe_print("Skipping token setup. Run `issue-worker token set` later.")
+
+    if provider == "gitlab" and token:
+        numeric_id = get_gitlab_project_id(config, token)
+        if numeric_id is not None:
+            config["projectId"] = numeric_id
+
+    if token:
+        adapter = ProviderAdapter(config, token)
+        adapter.get_project()
+        current_user = provider_current_user(config, token)
+        if current_user and current_user != username:
+            suggested_ref = make_credential_ref(provider, host, current_user)
+            safe_print(f"Token belongs to user {current_user}.")
+            if confirm(f"Use credentialRef {suggested_ref} instead?", default=True):
+                old_ref = credential_ref
+                credential_ref = suggested_ref
+                config["credentialRef"] = credential_ref
+                store_token(credential_ref, token)
+                if fallback_get(old_ref) == token and not fallback_get(credential_ref):
+                    fallback_set(credential_ref, token)
+    else:
+        safe_print("API access was not tested because no token is configured.")
+
+    path = write_project_config(config, root)
+    safe_print(f"Wrote {path}")
+    safe_print("Project config contains no token. Tokens are stored separately by credentialRef.")
+    return 0
+
+
+def print_token_guidance(provider: str) -> None:
+    safe_print("Token setup guidance:")
+    if provider == "github":
+        safe_print(
+            textwrap.dedent(
+                """
+                - Create a GitHub fine-grained PAT for the target repository.
+                - Issues read is enough to read issues.
+                - Issues write is needed to comment or close issues.
+                - Pull requests write and Contents write are needed for PR/branch workflows.
+                """
+            ).strip()
+        )
+    elif provider == "gitlab":
+        safe_print(
+            textwrap.dedent(
+                """
+                - Create a GitLab Personal Access Token for this account/instance.
+                - read_api is usually enough for reads.
+                - api is usually needed to comment, close issues, or create MRs.
+                """
+            ).strip()
+        )
+    elif provider == "gitee":
+        safe_print(
+            textwrap.dedent(
+                """
+                - Create a Gitee private token.
+                - Grant issue permissions for issue operations.
+                - Grant pull request/repo permissions only when needed.
+                """
+            ).strip()
+        )
+    safe_print("- Do not paste the token into chat. Use hidden input in `issue-worker token set`.")
+
+
+def store_token(credential_ref: str, token: str) -> str:
+    provider, host, username = parse_credential_ref(credential_ref)
+    if credential_approve(provider, host, username, token) and credential_fill(provider, host, username) == token:
+        return "git credential"
+    fallback_set(credential_ref, token)
+    return str(credentials_file())
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    ok = True
+    safe_print("issue-worker doctor")
+    if is_git_repo():
+        root = git_root()
+        safe_print(f"[ok] git repository: {root}")
+    else:
+        safe_print("[fail] not inside a git repository")
+        return 1
+
+    config_path = root / PROJECT_CONFIG
+    if config_path.exists():
+        safe_print(f"[ok] project config: {config_path}")
+    else:
+        safe_print(f"[fail] missing project config: {config_path}")
+        return 1
+
+    try:
+        config = load_project_config(root)
+        validate_config_shape(config)
+        safe_print(f"[ok] provider: {config['provider']}")
+        safe_print(f"[ok] host: {config['host']}")
+        safe_print(f"[ok] repoPath: {config['repoPath']}")
+        safe_print(f"[ok] projectId: {config.get('projectId')}")
+    except IssueWorkerError as exc:
+        safe_print(f"[fail] config: {exc}")
+        return 1
+
+    matches, detail = validate_project_matches_remote(config)
+    if matches:
+        safe_print(f"[ok] git remote matches project config: {detail}")
+    else:
+        safe_print(f"[warn] git remote mismatch: {detail}")
+        ok = False
+
+    source = token_source(config)
+    token = resolve_token(config, quiet=True)
+    if token:
+        safe_print(f"[ok] token: found via {source}")
+    else:
+        safe_print("[fail] token: not found")
+        safe_print("      Run `issue-worker token set` or use a temporary ISSUE_WORKER_TOKEN/provider token.")
+        return 1
+
+    try:
+        adapter = ProviderAdapter(config, token)
+        project = adapter.get_project()
+        name = ""
+        if isinstance(project.data, dict):
+            name = str(project.data.get("full_name") or project.data.get("path_with_namespace") or project.data.get("full_name") or "")
+        safe_print(f"[ok] API project lookup succeeded" + (f": {name}" if name else ""))
+    except IssueWorkerError as exc:
+        safe_print(f"[fail] API project lookup failed: {exc}")
+        return 1
+
+    return 0 if ok else 2
+
+
+def cmd_token_set(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    validate_config_shape(config)
+    ref = str(config["credentialRef"])
+    print_token_guidance(str(config["provider"]))
+    safe_print()
+    safe_print(f"Saving token for {ref}")
+    token = args.token
+    if token:
+        safe_print("Warning: passing a token as an argument can expose it in shell history. Prefer hidden input.")
+    else:
+        token = getpass.getpass("Token: ").strip()
+    if not token:
+        die("No token entered.")
+    store = store_token(ref, token)
+    safe_print(f"Token saved via {store}.")
+    safe_print("Testing token...")
+    return cmd_token_test(args)
+
+
+def cmd_token_test(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    validate_config_shape(config)
+    token = resolve_token(config)
+    if not token:
+        die("No token found.")
+    adapter = ProviderAdapter(config, token)
+    user = provider_current_user(config, token)
+    if user:
+        safe_print(f"[ok] current user: {user}")
+    result = adapter.get_project()
+    label = ""
+    if isinstance(result.data, dict):
+        label = str(result.data.get("full_name") or result.data.get("path_with_namespace") or result.data.get("name") or "")
+    safe_print(f"[ok] project access: {config['provider']} {config['host']} {config['repoPath']}" + (f" ({label})" if label else ""))
+    return 0
+
+
+def cmd_token_remove(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    validate_config_shape(config)
+    ref = str(config["credentialRef"])
+    provider, host, username = parse_credential_ref(ref)
+    removed_git = credential_reject(provider, host, username)
+    removed_file = fallback_remove(ref)
+    if removed_git or removed_file:
+        safe_print(f"Removed token for {ref}.")
+    else:
+        safe_print(f"No stored token found for {ref}.")
+    return 0
+
+
+def labels_to_text(labels: Any) -> str:
+    if labels is None:
+        return ""
+    if isinstance(labels, list):
+        result = []
+        for item in labels:
+            if isinstance(item, dict):
+                result.append(str(item.get("name") or item.get("title") or item))
+            else:
+                result.append(str(item))
+        return ", ".join(result)
+    return str(labels)
+
+
+def issue_number(provider: str, issue: Dict[str, Any]) -> str:
+    if provider == "gitlab":
+        return str(issue.get("iid") or issue.get("id") or "")
+    return str(issue.get("number") or issue.get("id") or "")
+
+
+def issue_state(issue: Dict[str, Any]) -> str:
+    return str(issue.get("state") or issue.get("state_name") or "")
+
+
+def issue_title(issue: Dict[str, Any]) -> str:
+    return str(issue.get("title") or "")
+
+
+def issue_body(provider: str, issue: Dict[str, Any]) -> str:
+    if provider == "gitlab":
+        return str(issue.get("description") or "")
+    return str(issue.get("body") or issue.get("description") or "")
+
+
+def issue_url(issue: Dict[str, Any]) -> str:
+    return str(issue.get("html_url") or issue.get("web_url") or "")
+
+
+def project_url(config: Dict[str, Any]) -> str:
+    provider = str(config.get("provider"))
+    host = str(config.get("host"))
+    repo_path = str(config.get("repoPath"))
+    if provider in {"github", "gitlab", "gitee"}:
+        return f"https://{host}/{repo_path}"
+    return f"{host}/{repo_path}"
+
+
+def issue_link(config: Dict[str, Any], issue_id: str) -> str:
+    provider = str(config.get("provider"))
+    base = project_url(config)
+    if provider == "gitlab":
+        return f"{base}/-/issues/{issue_id}"
+    return f"{base}/issues/{issue_id}"
+
+
+def pr_or_mr_label(provider: str) -> str:
+    return "MR" if provider == "gitlab" else "PR"
+
+
+def pr_or_mr_url(data: Any) -> str:
+    if isinstance(data, dict):
+        return str(data.get("html_url") or data.get("web_url") or data.get("url") or "")
+    return ""
+
+
+def proposed_close_keyword(provider: str, issue_id: str) -> str:
+    return f"Closes #{issue_id}"
+
+
+def build_pr_body(config: Dict[str, Any], issue: Dict[str, Any], issue_id: str, include_close: bool) -> str:
+    title = issue_title(issue) or f"Issue #{issue_id}"
+    lines = [
+        f"Issue: {issue_link(config, issue_id)}",
+        "",
+        "Summary:",
+        f"- {title}",
+        "",
+        "Implementation:",
+        "- See commits in this branch.",
+        "",
+        "Validation:",
+        "- Not recorded by issue-worker. Update this section before opening if validation has been run.",
+    ]
+    if include_close:
+        lines.extend(["", proposed_close_keyword(str(config.get("provider")), issue_id)])
+    return "\n".join(lines)
+
+
+def default_pr_title(config: Dict[str, Any], issue: Dict[str, Any], issue_id: str) -> str:
+    title = issue_title(issue) or f"Issue {issue_id}"
+    return f"Fix #{issue_id}: {title}"
+
+
+def derive_branch_name(config: Dict[str, Any], issue: Dict[str, Any], issue_id: str, explicit_slug: Optional[str]) -> str:
+    workflow = dict(DEFAULT_WORKFLOW)
+    workflow.update(config.get("workflow") or {})
+    prefix = str(workflow.get("branchPrefix") or "issue/")
+    slug = explicit_slug or slugify(issue_title(issue) or f"issue-{issue_id}")
+    return f"{prefix}{issue_id}-{slug}"
+
+
+def comment_body(provider: str, comment: Dict[str, Any]) -> str:
+    return str(comment.get("body") or "")
+
+
+def comment_author(comment: Dict[str, Any]) -> str:
+    user = comment.get("user") or comment.get("author")
+    if isinstance(user, dict):
+        return str(user.get("login") or user.get("username") or user.get("name") or "")
+    return ""
+
+
+def comment_created(comment: Dict[str, Any]) -> str:
+    return str(comment.get("created_at") or "")
+
+
+def cmd_issues_list(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    adapter = adapter_from_config(config)
+    issues = adapter.list_issues(args.state, args.labels, args.assignee, limit=args.limit)
+    if args.json:
+        filtered = [
+            issue
+            for issue in issues
+            if not (isinstance(issue, dict) and adapter.provider == "github" and "pull_request" in issue)
+        ]
+        safe_print(json.dumps(filtered, indent=2, ensure_ascii=False))
+        return 0
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        if adapter.provider == "github" and "pull_request" in issue:
+            continue
+        number = issue_number(adapter.provider, issue)
+        state = issue_state(issue)
+        title = issue_title(issue)
+        labels = labels_to_text(issue.get("labels"))
+        suffix = f" [{labels}]" if labels else ""
+        safe_print(f"#{number} {state} {title}{suffix}")
+    return 0
+
+
+def cmd_issues_get(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    adapter = adapter_from_config(config)
+    issue_result = adapter.get_issue(args.id)
+    issue = issue_result.data
+    if not isinstance(issue, dict):
+        safe_print(json.dumps(issue, indent=2, ensure_ascii=False))
+        return 0
+    comments = adapter.list_comments(args.id, limit=args.comments_limit)
+    if args.json:
+        safe_print(json.dumps({"issue": issue, "comments": comments}, indent=2, ensure_ascii=False))
+        return 0
+    safe_print(f"#{issue_number(adapter.provider, issue)} {issue_title(issue)}")
+    safe_print(f"State: {issue_state(issue)}")
+    if labels_to_text(issue.get("labels")):
+        safe_print(f"Labels: {labels_to_text(issue.get('labels'))}")
+    if issue_url(issue):
+        safe_print(f"URL: {issue_url(issue)}")
+    safe_print()
+    safe_print("Body:")
+    body = issue_body(adapter.provider, issue).strip()
+    safe_print(body if body else "(empty)")
+    safe_print()
+    safe_print("Comments:")
+    if not isinstance(comments, list) or not comments:
+        safe_print("(none)")
+        return 0
+    for idx, comment in enumerate(comments, start=1):
+        if not isinstance(comment, dict):
+            continue
+        author = comment_author(comment) or "unknown"
+        created = comment_created(comment)
+        text = comment_body(adapter.provider, comment).strip()
+        preview = "\n".join(text.splitlines()[: args.comment_lines])
+        if len(text.splitlines()) > args.comment_lines:
+            preview += "\n..."
+        safe_print(f"\n[{idx}] {author} {created}")
+        safe_print(preview if preview else "(empty)")
+    return 0
+
+
+def read_optional_body_arg(args: argparse.Namespace) -> str:
+    if args.body:
+        return args.body
+    if args.body_file:
+        if args.body_file == "-":
+            return sys.stdin.read()
+        return Path(args.body_file).read_text(encoding="utf-8")
+    return ""
+
+
+def read_body_arg(args: argparse.Namespace, prompt_text: str, *, require_explicit: bool = False) -> str:
+    if args.body:
+        return args.body
+    if args.body_file:
+        if args.body_file == "-":
+            return sys.stdin.read()
+        return Path(args.body_file).read_text(encoding="utf-8")
+    if require_explicit and not sys.stdin.isatty():
+        die("Body is required in non-interactive mode. Pass --body or --body-file.")
+    safe_print(prompt_text)
+    safe_print("End input with Ctrl-D (Unix/macOS) or Ctrl-Z then Enter (Windows).")
+    return sys.stdin.read()
+
+
+def cmd_issues_create(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    adapter = adapter_from_config(config)
+    title = args.title.strip()
+    if not title:
+        die("Issue title is empty.")
+    body = read_optional_body_arg(args).strip()
+    if not args.confirm:
+        safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']}")
+        safe_print(f"Title: {title}")
+        if args.labels:
+            safe_print(f"Labels: {args.labels}")
+        if not sys.stdin.isatty():
+            die("Creating an issue requires --confirm in non-interactive mode.")
+        if not confirm("Create this issue?", default=False):
+            safe_print("Cancelled.")
+            return 1
+    result = adapter.create_issue(title, body=body, labels=args.labels)
+    issue = result.data
+    if args.json:
+        safe_print(json.dumps(issue, indent=2, ensure_ascii=False))
+        return 0
+    number = ""
+    url = ""
+    if isinstance(issue, dict):
+        number = issue_number(adapter.provider, issue)
+        url = issue_url(issue)
+    safe_print("Issue created." + (f" #{number}" if number else "") + (f" {url}" if url else ""))
+    return 0
+
+
+def cmd_issues_comment(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    adapter = adapter_from_config(config)
+    body = read_body_arg(args, "Enter issue comment body.", require_explicit=True)
+    if not body.strip():
+        die("Comment body is empty.")
+    if not args.confirm:
+        safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']} issue #{args.id}")
+        if not sys.stdin.isatty():
+            die("Posting an issue comment requires --confirm in non-interactive mode.")
+        if not confirm("Post this comment?", default=False):
+            safe_print("Cancelled.")
+            return 1
+    result = adapter.create_comment(args.id, body)
+    url = ""
+    if isinstance(result.data, dict):
+        url = str(result.data.get("html_url") or result.data.get("web_url") or "")
+    safe_print("Comment posted." + (f" {url}" if url else ""))
+    return 0
+
+
+def cmd_issues_close(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    adapter = adapter_from_config(config)
+    if not args.confirm:
+        safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']} issue #{args.id}")
+        if not sys.stdin.isatty():
+            die("Closing an issue requires --confirm in non-interactive mode.")
+        if not confirm("Close this issue?", default=False):
+            safe_print("Cancelled.")
+            return 1
+    result = adapter.close_issue(args.id)
+    issue = result.data
+    state = ""
+    if isinstance(issue, dict):
+        state = issue_state(issue)
+    safe_print("Issue closed." + (f" State: {state}" if state else ""))
+    return 0
+
+
+def cmd_work_start(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    adapter = adapter_from_config(config, require_token=not args.local)
+    issue: Dict[str, Any] = {}
+    if not args.local:
+        result = adapter.get_issue(args.id)
+        if isinstance(result.data, dict):
+            issue = result.data
+    workflow = dict(DEFAULT_WORKFLOW)
+    workflow.update(config.get("workflow") or {})
+    branch_mode = str(workflow.get("branchMode") or "ask")
+    branch = args.branch or derive_branch_name(config, issue, args.id, args.slug)
+    base = args.base or str(config.get("defaultBranch") or "main")
+    safe_print(f"Work start guidance for issue #{args.id}")
+    safe_print(f"- Run: issue-worker doctor")
+    safe_print(f"- Read: issue-worker issues get {args.id}")
+    safe_print("- Summarize goal, acceptance criteria, risks, and unclear questions before coding.")
+    safe_print(f"- branchMode is {branch_mode!r}. Recommended branch: {branch}")
+    should_create = not args.local and (args.create_branch or (branch_mode == "always" and not args.no_create_branch))
+    if should_create:
+        if not args.confirm:
+            safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']} base {base} -> branch {branch}")
+            if not sys.stdin.isatty():
+                die("Creating a remote branch requires --confirm in non-interactive mode.")
+            if not confirm("Create this remote branch?", default=False):
+                safe_print("Cancelled.")
+                return 1
+        result = adapter.create_branch(base, branch)
+        url = pr_or_mr_url(result.data)
+        safe_print(f"Branch created: {branch}" + (f" {url}" if url else ""))
+    elif branch_mode == "always":
+        safe_print(f"- Create branch from {base}: git switch -c {branch}")
+    elif branch_mode == "ask":
+        safe_print("- Ask the user before creating the branch.")
+    elif branch_mode == "never":
+        safe_print("- Work on the current branch and warn about the risk.")
+    safe_print("- Ask before posting a start-progress issue comment unless project policy allows it.")
+    return 0
+
+
+def cmd_work_finish(args: argparse.Namespace) -> int:
+    config = load_project_config()
+    adapter = adapter_from_config(config, require_token=not args.local)
+    issue: Dict[str, Any] = {}
+    if not args.local:
+        result = adapter.get_issue(args.id)
+        if isinstance(result.data, dict):
+            issue = result.data
+    workflow = dict(DEFAULT_WORKFLOW)
+    workflow.update(config.get("workflow") or {})
+    completion_mode = str(workflow.get("completionMode") or "ask")
+    branch = args.branch or run_git(["branch", "--show-current"], check=False) or derive_branch_name(config, issue, args.id, args.slug)
+    base = args.base or str(config.get("defaultBranch") or "main")
+    title = args.title or default_pr_title(config, issue, args.id)
+    body = read_body_arg(args, "Enter PR/MR body.") if (args.body or args.body_file) else build_pr_body(
+        config, issue, args.id, include_close=args.close_on_merge
+    )
+    safe_print(f"Work finish guidance for issue #{args.id}")
+    safe_print("- Summarize code changes, validation commands, and results.")
+    safe_print("- Comment completion summary before closing the issue.")
+    safe_print(f"- completionMode is {completion_mode!r}.")
+    should_create = not args.local and (args.create_pr or (completion_mode == "mr" and not args.no_create_pr))
+    if should_create:
+        if not args.confirm:
+            label = pr_or_mr_label(str(config["provider"]))
+            safe_print(f"Target: {config['provider']} {config['host']} {config['repoPath']} {label} {branch} -> {base}")
+            safe_print(f"Title: {title}")
+            if args.close_on_merge:
+                safe_print(f"Body includes merge-time close keyword for issue #{args.id}.")
+            if not sys.stdin.isatty():
+                die("Creating a PR/MR requires --confirm in non-interactive mode.")
+            if not confirm(f"Create this {label}?", default=False):
+                safe_print("Cancelled.")
+                return 1
+        result = adapter.create_pull_or_merge_request(branch, base, title, body)
+        label = pr_or_mr_label(str(config["provider"]))
+        url = pr_or_mr_url(result.data)
+        safe_print(f"{label} created." + (f" {url}" if url else ""))
+    elif completion_mode == "mr":
+        safe_print("- Create a PR/MR when supported and allowed by user/project policy.")
+    elif completion_mode == "direct":
+        safe_print("- Direct push requires explicit confirmation unless project policy allows it.")
+    else:
+        safe_print("- Ask before pushing, creating PR/MR, or closing the issue.")
+    safe_print("- Do not close before PR/MR merge unless the user explicitly asks.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="issue-worker",
+        description="Work from GitHub, GitLab, self-hosted GitLab, and Gitee issues.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="Initialize .issue-worker/project.json for the current git repo.")
+    p_init.add_argument("--remote", help="Git remote name, defaults to origin when present.")
+    p_init.add_argument("--provider", choices=sorted(SUPPORTED_PROVIDERS), help="Override provider detection.")
+    p_init.add_argument("--api-base-url", help="Override API base URL.")
+    p_init.add_argument("--username", help="Credential username for credentialRef.")
+    p_init.add_argument("--default-branch", help="Default branch to record in project config.")
+    p_init.set_defaults(func=cmd_init)
+
+    p_doctor = sub.add_parser("doctor", help="Validate git repo, config, token, and API access.")
+    p_doctor.set_defaults(func=cmd_doctor)
+
+    p_token = sub.add_parser("token", help="Manage local issue-worker tokens.")
+    token_sub = p_token.add_subparsers(dest="token_command", required=True)
+    p_token_set = token_sub.add_parser("set", help="Set token using hidden input.")
+    p_token_set.add_argument("--token", help="Token value. Avoid this because it may enter shell history.")
+    p_token_set.set_defaults(func=cmd_token_set)
+    p_token_test = token_sub.add_parser("test", help="Test configured token.")
+    p_token_test.set_defaults(func=cmd_token_test)
+    p_token_remove = token_sub.add_parser("remove", help="Remove configured token.")
+    p_token_remove.set_defaults(func=cmd_token_remove)
+
+    p_issues = sub.add_parser("issues", help="Issue operations.")
+    issues_sub = p_issues.add_subparsers(dest="issues_command", required=True)
+    p_list = issues_sub.add_parser("list", help="List issues.")
+    p_list.add_argument("--state", default="open", help="Issue state, default: open.")
+    p_list.add_argument("--labels", help="Comma-separated labels where supported.")
+    p_list.add_argument("--assignee", help="Assignee filter where supported.")
+    p_list.add_argument("--limit", type=int, default=DEFAULT_LIST_LIMIT, help="Maximum issues to fetch, default: 100.")
+    p_list.add_argument("--json", action="store_true", help="Print raw issue JSON for agent parsing.")
+    p_list.set_defaults(func=cmd_issues_list)
+
+    p_get = issues_sub.add_parser("get", help="Get issue detail and comments.")
+    p_get.add_argument("id", help="Issue number/iid/id.")
+    p_get.add_argument("--comment-lines", type=int, default=20, help="Max lines to print per comment.")
+    p_get.add_argument("--comments-limit", type=int, default=DEFAULT_COMMENTS_LIMIT, help="Maximum comments to fetch, default: 200.")
+    p_get.add_argument("--json", action="store_true", help="Print raw issue/comment JSON for agent parsing.")
+    p_get.set_defaults(func=cmd_issues_get)
+
+    p_create = issues_sub.add_parser("create", help="Create an issue.")
+    p_create.add_argument("--title", required=True, help="Issue title.")
+    p_create.add_argument("--body", help="Issue body/description.")
+    p_create.add_argument("--body-file", help="Read body from file, or '-' for stdin.")
+    p_create.add_argument("--labels", help="Comma-separated labels where supported.")
+    p_create.add_argument("--confirm", action="store_true", help="Confirm issue creation in non-interactive mode.")
+    p_create.add_argument("--json", action="store_true", help="Print raw created issue JSON for agent parsing.")
+    p_create.set_defaults(func=cmd_issues_create)
+
+    p_comment = issues_sub.add_parser("comment", help="Post an issue comment.")
+    p_comment.add_argument("id", help="Issue number/iid/id.")
+    p_comment.add_argument("--body", help="Comment body.")
+    p_comment.add_argument("--body-file", help="Read body from file, or '-' for stdin.")
+    p_comment.add_argument("--confirm", action="store_true", help="Skip interactive confirmation.")
+    p_comment.set_defaults(func=cmd_issues_comment)
+
+    p_close = issues_sub.add_parser("close", help="Close an issue.")
+    p_close.add_argument("id", help="Issue number/iid/id.")
+    p_close.add_argument("--confirm", action="store_true", help="Confirm close operation.")
+    p_close.set_defaults(func=cmd_issues_close)
+
+    p_work = sub.add_parser("work", help="Issue workflow helpers.")
+    work_sub = p_work.add_subparsers(dest="work_command", required=True)
+    p_start = work_sub.add_parser("start", help="Print start-work guidance.")
+    p_start.add_argument("id", help="Issue number/iid/id.")
+    p_start.add_argument("--slug", help="Short branch slug.")
+    p_start.add_argument("--branch", help="Branch name to use instead of derived issue/{id}-{slug}.")
+    p_start.add_argument("--base", help="Base branch, defaults to project defaultBranch.")
+    p_start.add_argument("--create-branch", action="store_true", help="Create the remote branch through the provider API.")
+    p_start.add_argument("--no-create-branch", action="store_true", help="Do not auto-create even when branchMode is always.")
+    p_start.add_argument("--confirm", action="store_true", help="Confirm branch creation in non-interactive mode.")
+    p_start.add_argument("--local", action="store_true", help="Do not call provider APIs; print local guidance only.")
+    p_start.set_defaults(func=cmd_work_start)
+    p_finish = work_sub.add_parser("finish", help="Print finish-work guidance.")
+    p_finish.add_argument("id", help="Issue number/iid/id.")
+    p_finish.add_argument("--slug", help="Short branch slug when deriving branch name.")
+    p_finish.add_argument("--branch", help="Source branch, defaults to current git branch.")
+    p_finish.add_argument("--base", help="Target branch, defaults to project defaultBranch.")
+    p_finish.add_argument("--title", help="PR/MR title.")
+    p_finish.add_argument("--body", help="PR/MR body.")
+    p_finish.add_argument("--body-file", help="Read PR/MR body from file, or '-' for stdin.")
+    p_finish.add_argument("--close-on-merge", action="store_true", help="Include Closes/Fixes keyword in PR/MR body.")
+    p_finish.add_argument("--create-pr", action="store_true", help="Create PR/MR through the provider API.")
+    p_finish.add_argument("--no-create-pr", action="store_true", help="Do not auto-create even when completionMode is mr.")
+    p_finish.add_argument("--confirm", action="store_true", help="Confirm PR/MR creation in non-interactive mode.")
+    p_finish.add_argument("--local", action="store_true", help="Do not call provider APIs; print local guidance only.")
+    p_finish.set_defaults(func=cmd_work_finish)
+
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return int(args.func(args))
+    except IssueWorkerError as exc:
+        eprint(f"error: {exc}")
+        return 1
+    except KeyboardInterrupt:
+        eprint("\nCancelled.")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

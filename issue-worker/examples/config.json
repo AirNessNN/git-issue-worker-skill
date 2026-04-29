@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "defaults": {
+    "commentPolicy": "progress_blocker_done",
+    "branchMode": "ask",
+    "completionMode": "ask"
+  },
+  "credentialStore": {
+    "preferred": "git-credential",
+    "fallback": "user-config-file"
+  },
+  "notes": [
+    "This is an example user-level defaults file, not a replacement for .issue-worker/project.json.",
+    "Do not store tokens in this file."
+  ]
+}
