@@ -13,6 +13,7 @@ import getpass
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -64,6 +65,31 @@ def safe_print(message: str = "") -> None:
         print(message)
     except BrokenPipeError:
         raise SystemExit(0)
+
+
+def cli_invocation() -> str:
+    executable = sys.executable or "python3"
+    script = str(Path(__file__).resolve())
+    return f"{shlex.quote(executable)} {shlex.quote(script)}"
+
+
+def token_creation_url(provider: str, host: str) -> str:
+    if provider == "github":
+        return "https://github.com/settings/personal-access-tokens/new"
+    if provider == "gitlab":
+        return f"https://{host}/-/user_settings/personal_access_tokens"
+    if provider == "gitee":
+        return "https://gitee.com/profile/personal_access_tokens"
+    return ""
+
+
+def token_setup_oneliner() -> str:
+    command = cli_invocation()
+    return (
+        "read -rsp 'Issue-worker token: ' ISSUE_WORKER_TOKEN && echo && "
+        f"printf '%s\\n' \"$ISSUE_WORKER_TOKEN\" | {command} token set --from-stdin; "
+        "unset ISSUE_WORKER_TOKEN"
+    )
 
 
 def run_git(args: List[str], cwd: Optional[Path] = None, check: bool = True) -> str:
@@ -946,7 +972,7 @@ def adapter_from_config(config: Dict[str, Any], require_token: bool = True) -> P
     token = resolve_token(config)
     if require_token and not token:
         die(
-            "No token found. Use `issue-worker token set`, configure git credential, "
+            "No token found. Run the setup command shown by `issue-worker doctor`, configure git credential, "
             "or set a temporary ISSUE_WORKER_TOKEN/provider token environment variable."
         )
     return ProviderAdapter(config, token)
@@ -1068,16 +1094,18 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     token = resolve_token(config, quiet=True)
     if not token:
-        print_token_guidance(provider)
+        print_token_guidance(provider, host)
         safe_print()
         safe_print(f"No token found for {credential_ref}.")
+        safe_print("Create a token, then run this command locally so the token is hidden and tested:")
+        safe_print(f"  {token_setup_oneliner()}")
         if sys.stdin.isatty() and confirm("Set a token now using hidden input?", default=True):
             token = getpass.getpass("Token: ").strip()
             if not token:
                 die("No token entered.")
             store_token(credential_ref, token)
         else:
-            safe_print("Skipping token setup. Run `issue-worker token set` later.")
+            safe_print("Skipping token setup for now.")
 
     if provider == "gitlab" and token:
         numeric_id = get_gitlab_project_id(config, token)
@@ -1107,13 +1135,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def print_token_guidance(provider: str) -> None:
+def print_token_guidance(provider: str, host: str = "") -> None:
     safe_print("Token setup guidance:")
+    creation_url = token_creation_url(provider, host)
     if provider == "github":
         safe_print(
             textwrap.dedent(
-                """
+                f"""
                 - Create a GitHub fine-grained PAT for the target repository.
+                - Token page: {creation_url}
                 - Issues read is enough to read issues.
                 - Issues write is needed to comment or close issues.
                 - Pull requests write and Contents write are needed for PR/branch workflows.
@@ -1123,8 +1153,9 @@ def print_token_guidance(provider: str) -> None:
     elif provider == "gitlab":
         safe_print(
             textwrap.dedent(
-                """
+                f"""
                 - Create a GitLab Personal Access Token for this account/instance.
+                - Token page: {creation_url}
                 - read_api is usually enough for reads.
                 - api is usually needed to comment, close issues, or create MRs.
                 """
@@ -1133,14 +1164,15 @@ def print_token_guidance(provider: str) -> None:
     elif provider == "gitee":
         safe_print(
             textwrap.dedent(
-                """
+                f"""
                 - Create a Gitee private token.
+                - Token page: {creation_url}
                 - Grant issue permissions for issue operations.
                 - Grant pull request/repo permissions only when needed.
                 """
             ).strip()
         )
-    safe_print("- Do not paste the token into chat. Use hidden input in `issue-worker token set`.")
+    safe_print("- Do not paste the token into chat. Store it locally with hidden input.")
 
 
 def store_token(credential_ref: str, token: str) -> str:
@@ -1192,7 +1224,9 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         safe_print(f"[ok] token: found via {source}")
     else:
         safe_print("[fail] token: not found")
-        safe_print("      Run `issue-worker token set` or use a temporary ISSUE_WORKER_TOKEN/provider token.")
+        print_token_guidance(str(config["provider"]), str(config["host"]))
+        safe_print("Run this local command after creating the token:")
+        safe_print(f"  {token_setup_oneliner()}")
         return 1
 
     try:
@@ -1213,12 +1247,14 @@ def cmd_token_set(args: argparse.Namespace) -> int:
     config = load_project_config()
     validate_config_shape(config)
     ref = str(config["credentialRef"])
-    print_token_guidance(str(config["provider"]))
+    print_token_guidance(str(config["provider"]), str(config["host"]))
     safe_print()
     safe_print(f"Saving token for {ref}")
     token = args.token
     if token:
         safe_print("Warning: passing a token as an argument can expose it in shell history. Prefer hidden input.")
+    elif args.from_stdin:
+        token = sys.stdin.readline().strip()
     else:
         token = getpass.getpass("Token: ").strip()
     if not token:
@@ -1649,6 +1685,7 @@ def build_parser() -> argparse.ArgumentParser:
     token_sub = p_token.add_subparsers(dest="token_command", required=True)
     p_token_set = token_sub.add_parser("set", help="Set token using hidden input.")
     p_token_set.add_argument("--token", help="Token value. Avoid this because it may enter shell history.")
+    p_token_set.add_argument("--from-stdin", action="store_true", help="Read one token line from stdin for scripted hidden-input setup.")
     p_token_set.set_defaults(func=cmd_token_set)
     p_token_test = token_sub.add_parser("test", help="Test configured token.")
     p_token_test.set_defaults(func=cmd_token_test)

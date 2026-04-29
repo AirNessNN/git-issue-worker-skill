@@ -287,6 +287,28 @@ class InitTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("Multiple remote candidates", proc.stderr)
 
+    def test_init_without_token_prints_actionable_bundled_setup_command(self):
+        tmp, repo = init_git_repo("git@git.arlth.cn:huhw/issue-test.git")
+        with tmp:
+            proc = run_cmd(
+                ["init", "--provider", "gitlab", "--api-base-url", "https://git.arlth.cn/api/v4", "--username", "huhw"],
+                repo,
+            )
+            self.assertIn("https://git.arlth.cn/-/user_settings/personal_access_tokens", proc.stdout)
+            self.assertIn(str(CLI), proc.stdout)
+            self.assertIn("token set --from-stdin", proc.stdout)
+            self.assertNotIn("Run `issue-worker token set` later", proc.stdout)
+
+    def test_doctor_without_token_prints_actionable_bundled_setup_command(self):
+        tmp, repo = init_git_repo("git@git.arlth.cn:huhw/issue-test.git")
+        with tmp:
+            write_project_config(repo, "https://git.arlth.cn/api/v4")
+            proc = run_cmd(["doctor"], repo, check=False)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("https://git.arlth.cn/-/user_settings/personal_access_tokens", proc.stdout)
+            self.assertIn(str(CLI), proc.stdout)
+            self.assertIn("token set --from-stdin", proc.stdout)
+
 
 class FakeGitLabAgentScenarioTests(unittest.TestCase):
     def test_agent_issue_flow_against_fake_gitlab(self):
@@ -403,6 +425,21 @@ class FakeGitLabAgentScenarioTests(unittest.TestCase):
                 close_proc = run_cmd(["issues", "close", "1"], repo, env=env, check=False)
                 self.assertNotEqual(close_proc.returncode, 0)
                 self.assertIn("requires --confirm", close_proc.stderr)
+
+    def test_token_set_from_stdin_saves_and_tests_token(self):
+        with FakeGitLabServer() as server:
+            tmp, repo = init_git_repo("git@git.arlth.cn:huhw/issue-test.git")
+            with tmp:
+                write_project_config(repo, server.url)
+                xdg_home = tempfile.mkdtemp(prefix="issue-worker-config-")
+                proc = run_cmd(
+                    ["token", "set", "--from-stdin"],
+                    repo,
+                    env={"XDG_CONFIG_HOME": xdg_home},
+                    input_text=FakeGitLabHandler.token + "\n",
+                )
+                self.assertIn("Token saved", proc.stdout)
+                self.assertIn("[ok] project access", proc.stdout)
 
 
 if __name__ == "__main__":

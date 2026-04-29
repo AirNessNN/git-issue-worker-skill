@@ -40,10 +40,22 @@ It must never store the token.
 
 ## Commands
 
+If `issue-worker` is not on `PATH`, replace it with the bundled command:
+
+```bash
+python3 /home/airness/.agents/skills/issue-worker/scripts/issue-worker
+```
+
 Set a token without echoing it:
 
 ```bash
 issue-worker token set
+```
+
+For a user-facing setup instruction, prefer this one-liner because it works even when the CLI is not on `PATH` and keeps the token out of chat:
+
+```bash
+read -rsp 'Issue-worker token: ' ISSUE_WORKER_TOKEN && echo && printf '%s\n' "$ISSUE_WORKER_TOKEN" | python3 /home/airness/.agents/skills/issue-worker/scripts/issue-worker token set --from-stdin; unset ISSUE_WORKER_TOKEN
 ```
 
 Test a saved token:
@@ -69,6 +81,12 @@ The fallback file is machine-private. Keep permissions restricted and never comm
 
 Prefer a fine-grained Personal Access Token.
 
+Create it at:
+
+```text
+https://github.com/settings/personal-access-tokens/new
+```
+
 Minimum permissions depend on the task:
 
 - Read issues: repository Issues read.
@@ -82,6 +100,18 @@ Use the smallest repository scope possible. If a token was pasted into chat or l
 
 For GitLab SaaS or self-hosted GitLab, create a Personal Access Token from the target account.
 
+Create it at:
+
+```text
+https://{gitlab-host}/-/user_settings/personal_access_tokens
+```
+
+For example:
+
+```text
+https://git.arlth.cn/-/user_settings/personal_access_tokens
+```
+
 Common permissions:
 
 - Read project and issue data: `read_api`.
@@ -92,6 +122,12 @@ Some self-hosted GitLab instances customize permissions or token policies. If `r
 ## Gitee Token
 
 Create a Gitee private token from account settings.
+
+Create it at:
+
+```text
+https://gitee.com/profile/personal_access_tokens
+```
 
 Grant only the permissions required for the workflow:
 

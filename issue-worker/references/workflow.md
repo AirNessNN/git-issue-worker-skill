@@ -4,7 +4,7 @@ This workflow turns a repository issue into implemented, verified, and communica
 
 ## A. Prepare
 
-1. Run `issue-worker doctor`.
+1. Run `issue-worker doctor`. If `issue-worker` is not on `PATH`, use the bundled command `python3 <skill-dir>/scripts/issue-worker doctor`.
 2. Confirm `.issue-worker/project.json` matches the current git remote and repository.
 3. Run `git status`.
 4. If the worktree has user changes, do not overwrite them. Explain the risk and ask how to proceed.

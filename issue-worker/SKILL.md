@@ -17,12 +17,13 @@ Preserve commands, code identifiers, branch names, commit hashes, API fields, an
 
 ## First Steps
 
-1. Run from the repository root. If the `issue-worker` command is not on `PATH`, invoke the bundled CLI directly:
+1. Run from the repository root. Do not assume `issue-worker` is on `PATH`. First try `issue-worker --help`; if it fails with "command not found", always invoke the bundled CLI directly:
 
    ```bash
    python3 <skill-dir>/scripts/issue-worker <subcommand>
    ```
 
+   When asking the user to run a command, give the exact bundled command form with the real skill path, not only `issue-worker ...`.
 2. Check whether `.issue-worker/project.json` exists.
 3. If it does not exist, initialize it before asking for issue content:
    - Run `issue-worker init --username <local-or-repo-username>` when the remote lets provider detection succeed.
@@ -30,9 +31,14 @@ Preserve commands, code identifiers, branch names, commit hashes, API fields, an
    - `init` may succeed without a token; it still records non-sensitive project config so future agents know how to continue.
 4. Run `issue-worker doctor`.
 5. If `doctor` says the token is missing, do not try the web UI or conclude the issue is inaccessible. Configure credentials first:
-   - Prefer `issue-worker token set` so hidden input stores the token under `credentialRef`.
-   - If non-interactive or the user has not provided a token locally, ask specifically for a local token setup, not for pasted issue text.
-   - Tell the user the minimum scope: issue reads usually need `read_api` on GitLab, Issues read on GitHub, and issue read permission on Gitee.
+   - Explain where to create the token for the detected provider/host and the minimum scope: issue reads usually need `read_api` on GitLab, Issues read on GitHub, and issue read permission on Gitee.
+   - Give the user a complete local command that hides input and pipes it into the bundled CLI, for example:
+
+     ```bash
+     read -rsp 'Issue-worker token: ' ISSUE_WORKER_TOKEN && echo && printf '%s\n' "$ISSUE_WORKER_TOKEN" | python3 /home/airness/.agents/skills/issue-worker/scripts/issue-worker token set --from-stdin; unset ISSUE_WORKER_TOKEN
+     ```
+
+   - Tell the user to paste the token into that terminal prompt, not into chat. If the CLI lacks `--from-stdin`, use the bundled `python3 <skill-dir>/scripts/issue-worker token set` command and say it will prompt for hidden input.
 6. Check `git status` before editing code. If the worktree contains user changes, do not overwrite them; explain the risk and ask how to proceed.
 7. Get issue content through the CLI:
    - If the user provided an id or URL, run `issue-worker issues get <id> --json`.
@@ -46,7 +52,7 @@ Do not stop after discovering the repository has no local business code or the b
 
 1. Ensure `.issue-worker/project.json` exists. If missing, run `issue-worker init` or create it from the git remote with explicit provider/API options.
 2. Run `issue-worker doctor` and report the exact failing check.
-3. If token is missing, ask the user to run `issue-worker token set` or otherwise make a token available through local credential storage or a temporary environment variable. Do not ask the user to paste the token into chat.
+3. If token is missing, explain token creation and provide a complete local hidden-input setup command using the bundled CLI path. Do not ask the user to paste the token into chat.
 4. If token exists but API lookup fails, report provider, host, repo path/project id, endpoint type, HTTP status, and likely cause.
 5. Only ask for the issue body or issue link as a fallback after the CLI path is initialized and token/API recovery is blocked.
 
