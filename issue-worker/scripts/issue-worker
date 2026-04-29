@@ -67,6 +67,17 @@ def safe_print(message: str = "") -> None:
         raise SystemExit(0)
 
 
+def ui_language() -> str:
+    raw = (os.environ.get("ISSUE_WORKER_LANG") or "").lower()
+    if raw.startswith("en"):
+        return "en"
+    return "zh"
+
+
+def ui_text(en: str, zh: str) -> str:
+    return zh if ui_language() == "zh" else en
+
+
 def cli_invocation() -> str:
     executable = sys.executable or "python3"
     script = str(Path(__file__).resolve())
@@ -982,8 +993,11 @@ def adapter_from_config(config: Dict[str, Any], require_token: bool = True) -> P
     token = resolve_token(config)
     if require_token and not token:
         die(
-            "No token found. Run the setup command shown by `issue-worker doctor`, configure git credential, "
-            "or set a temporary ISSUE_WORKER_TOKEN/provider token environment variable."
+            ui_text(
+                "No token found. Run the setup command shown by `issue-worker doctor`, configure git credential, "
+                "or set a temporary ISSUE_WORKER_TOKEN/provider token environment variable.",
+                "未找到 token。请运行 `issue-worker doctor` 输出的配置命令，或临时设置 ISSUE_WORKER_TOKEN/provider token 环境变量。",
+            )
         )
     return ProviderAdapter(config, token)
 
@@ -1106,8 +1120,8 @@ def cmd_init(args: argparse.Namespace) -> int:
     if not token:
         print_token_guidance(provider, host)
         safe_print()
-        safe_print(f"No token found for {credential_ref}.")
-        safe_print("Create a token, then run this command locally so the token is hidden and tested:")
+        safe_print(ui_text(f"No token found for {credential_ref}.", f"未找到 {credential_ref} 对应的 token。"))
+        safe_print(ui_text("Create a token, then run this command locally so the token is hidden and tested:", "创建 token 后，在本地运行下面这条命令；它会隐藏输入、保存 token，并立即测试："))
         safe_print(f"  {token_setup_oneliner()}")
         if sys.stdin.isatty() and confirm("Set a token now using hidden input?", default=True):
             token = getpass.getpass("Token: ").strip()
@@ -1115,7 +1129,7 @@ def cmd_init(args: argparse.Namespace) -> int:
                 die("No token entered.")
             store_token(credential_ref, token)
         else:
-            safe_print("Skipping token setup for now.")
+            safe_print(ui_text("Skipping token setup for now.", "暂时跳过 token 配置。"))
 
     if provider == "gitlab" and token:
         numeric_id = get_gitlab_project_id(config, token)
@@ -1137,58 +1151,86 @@ def cmd_init(args: argparse.Namespace) -> int:
                 if fallback_get(old_ref) == token and not fallback_get(credential_ref):
                     fallback_set(credential_ref, token)
     else:
-        safe_print("API access was not tested because no token is configured.")
+        safe_print(ui_text("API access was not tested because no token is configured.", "因为还没有配置 token，未测试 API 访问。"))
 
     path = write_project_config(config, root)
-    safe_print(f"Wrote {path}")
-    safe_print("Project config contains no token. Tokens are stored separately by credentialRef.")
+    safe_print(ui_text(f"Wrote {path}", f"已写入 {path}"))
+    safe_print(ui_text("Project config contains no token. Tokens are stored separately by credentialRef.", "项目配置不包含 token。token 会按 credentialRef 单独存储。"))
     return 0
 
 
 def print_token_guidance(provider: str, host: str = "") -> None:
-    safe_print("Token setup guidance:")
+    safe_print(ui_text("Token setup guidance:", "Token 配置说明："))
     creation_url = token_creation_url(provider, host)
     if provider == "github":
         safe_print(
-            textwrap.dedent(
-                f"""
-                - Create a GitHub fine-grained PAT for the target repository.
-                - Token page: {creation_url}
-                - Issues read is enough to read issues.
-                - Issues write is needed to comment or close issues.
-                - Pull requests write and Contents write are needed for PR/branch workflows.
-                """
-            ).strip()
+            ui_text(
+                textwrap.dedent(
+                    f"""
+                    - Create a GitHub fine-grained PAT for the target repository.
+                    - Token page: {creation_url}
+                    - Issues read is enough to read issues.
+                    - Issues write is needed to comment or close issues.
+                    - Pull requests write and Contents write are needed for PR/branch workflows.
+                    """
+                ).strip(),
+                textwrap.dedent(
+                    f"""
+                    - 在 GitHub 为目标仓库创建 fine-grained Personal Access Token。
+                    - Token 页面：{creation_url}
+                    - 只读取 issue 通常只需要 Issues read。
+                    - 评论或关闭 issue 需要 Issues write。
+                    - 创建 PR 或分支流程需要 Pull requests write，通常还需要 Contents write。
+                    """
+                ).strip(),
+            )
         )
     elif provider == "gitlab":
         safe_print(
-            textwrap.dedent(
-                f"""
-                - Create a GitLab Personal Access Token for this account/instance.
-                - Token page: {creation_url}
-                - read_api is usually enough for reads.
-                - api is usually needed to comment, close issues, or create MRs.
-                """
-            ).strip()
+            ui_text(
+                textwrap.dedent(
+                    f"""
+                    - Create a GitLab Personal Access Token for this account/instance.
+                    - Token page: {creation_url}
+                    - read_api is usually enough for reads.
+                    - api is usually needed to comment, close issues, or create MRs.
+                    """
+                ).strip(),
+                textwrap.dedent(
+                    f"""
+                    - 在当前 GitLab 账号/实例创建 Personal Access Token。
+                    - Token 页面：{creation_url}
+                    - 只读取项目和 issue 通常只需要 read_api。
+                    - 评论、关闭 issue 或创建 MR 通常需要 api。
+                    """
+                ).strip(),
+            )
         )
     elif provider == "gitee":
         safe_print(
-            textwrap.dedent(
-                f"""
-                - Create a Gitee private token.
-                - Token page: {creation_url}
-                - Grant issue permissions for issue operations.
-                - Grant pull request/repo permissions only when needed.
-                """
-            ).strip()
+            ui_text(
+                textwrap.dedent(
+                    f"""
+                    - Create a Gitee private token.
+                    - Token page: {creation_url}
+                    - Grant issue permissions for issue operations.
+                    - Grant pull request/repo permissions only when needed.
+                    """
+                ).strip(),
+                textwrap.dedent(
+                    f"""
+                    - 创建 Gitee 私人令牌。
+                    - Token 页面：{creation_url}
+                    - issue 操作需要授予 issue 相关权限。
+                    - 只有需要 PR/分支流程时才授予 Pull Request 或仓库权限。
+                    """
+                ).strip(),
+            )
         )
-    safe_print("- Do not paste the token into chat. Store it locally with hidden input.")
+    safe_print(ui_text("- Do not paste the token into chat. Store it locally with hidden input.", "- 不要把 token 粘贴到聊天里。请在本地终端隐藏输入并保存。"))
 
 
 def store_token(credential_ref: str, token: str) -> str:
-    provider, host, username = parse_credential_ref(credential_ref)
-    if credential_approve(provider, host, username, token) and credential_fill(provider, host, username) == token:
-        return "git credential"
     fallback_set(credential_ref, token)
     return str(credentials_file())
 
@@ -1235,7 +1277,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     else:
         safe_print("[fail] token: not found")
         print_token_guidance(str(config["provider"]), str(config["host"]))
-        safe_print("Run this local command after creating the token:")
+        safe_print(ui_text("Run this local command after creating the token:", "创建 token 后，在本地运行下面这条命令："))
         safe_print(f"  {token_setup_oneliner()}")
         return 1
 
@@ -1259,19 +1301,19 @@ def cmd_token_set(args: argparse.Namespace) -> int:
     ref = str(config["credentialRef"])
     print_token_guidance(str(config["provider"]), str(config["host"]))
     safe_print()
-    safe_print(f"Saving token for {ref}")
+    safe_print(ui_text(f"Saving token for {ref}", f"正在保存 {ref} 对应的 token"))
     token = args.token
     if token:
-        safe_print("Warning: passing a token as an argument can expose it in shell history. Prefer hidden input.")
+        safe_print(ui_text("Warning: passing a token as an argument can expose it in shell history. Prefer hidden input.", "警告：通过命令参数传 token 可能会暴露在 shell 历史中，建议使用隐藏输入。"))
     elif args.from_stdin:
         token = sys.stdin.readline().strip()
     else:
         token = getpass.getpass("Token: ").strip()
     if not token:
-        die("No token entered.")
+        die(ui_text("No token entered.", "没有输入 token。"))
     store = store_token(ref, token)
-    safe_print(f"Token saved via {store}.")
-    safe_print("Testing token...")
+    safe_print(ui_text(f"Token saved via {store}.", f"Token 已通过 {store} 保存。"))
+    safe_print(ui_text("Testing token...", "正在测试 token..."))
     return cmd_token_test(args)
 
 
@@ -1280,16 +1322,16 @@ def cmd_token_test(args: argparse.Namespace) -> int:
     validate_config_shape(config)
     token = resolve_token(config)
     if not token:
-        die("No token found.")
+        die(ui_text("No token found.", "未找到 token。"))
     adapter = ProviderAdapter(config, token)
     user = provider_current_user(config, token)
     if user:
-        safe_print(f"[ok] current user: {user}")
+        safe_print(ui_text(f"[ok] current user: {user}", f"[ok] 当前用户：{user}"))
     result = adapter.get_project()
     label = ""
     if isinstance(result.data, dict):
         label = str(result.data.get("full_name") or result.data.get("path_with_namespace") or result.data.get("name") or "")
-    safe_print(f"[ok] project access: {config['provider']} {config['host']} {config['repoPath']}" + (f" ({label})" if label else ""))
+    safe_print(ui_text(f"[ok] project access: {config['provider']} {config['host']} {config['repoPath']}", f"[ok] 项目访问正常：{config['provider']} {config['host']} {config['repoPath']}") + (f" ({label})" if label else ""))
     return 0
 
 
@@ -1301,9 +1343,9 @@ def cmd_token_remove(args: argparse.Namespace) -> int:
     removed_git = credential_reject(provider, host, username)
     removed_file = fallback_remove(ref)
     if removed_git or removed_file:
-        safe_print(f"Removed token for {ref}.")
+        safe_print(ui_text(f"Removed token for {ref}.", f"已删除 {ref} 对应的 token。"))
     else:
-        safe_print(f"No stored token found for {ref}.")
+        safe_print(ui_text(f"No stored token found for {ref}.", f"没有找到 {ref} 对应的已保存 token。"))
     return 0
 
 

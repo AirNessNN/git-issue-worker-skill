@@ -300,6 +300,8 @@ class InitTests(unittest.TestCase):
                 repo,
             )
             self.assertIn("https://git.arlth.cn/-/user_settings/personal_access_tokens", proc.stdout)
+            self.assertIn("Token 配置说明", proc.stdout)
+            self.assertIn("只读取项目和 issue 通常只需要 read_api", proc.stdout)
             self.assertIn(str(CLI), proc.stdout)
             self.assertIn("token set --from-stdin", proc.stdout)
             self.assertNotIn("Run `issue-worker token set` later", proc.stdout)
@@ -311,6 +313,7 @@ class InitTests(unittest.TestCase):
             proc = run_cmd(["doctor"], repo, check=False)
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("https://git.arlth.cn/-/user_settings/personal_access_tokens", proc.stdout)
+            self.assertIn("Token 配置说明", proc.stdout)
             self.assertIn(str(CLI), proc.stdout)
             self.assertIn("token set --from-stdin", proc.stdout)
 
@@ -443,8 +446,8 @@ class FakeGitLabAgentScenarioTests(unittest.TestCase):
                     env={"XDG_CONFIG_HOME": xdg_home},
                     input_text=FakeGitLabHandler.token + "\n",
                 )
-                self.assertIn("Token saved", proc.stdout)
-                self.assertIn("[ok] project access", proc.stdout)
+                self.assertIn("Token 已通过", proc.stdout)
+                self.assertIn("[ok] 项目访问正常", proc.stdout)
 
     def test_fallback_token_wins_when_git_credential_helper_would_prompt(self):
         with FakeGitLabServer() as server:
@@ -473,7 +476,7 @@ class FakeGitLabAgentScenarioTests(unittest.TestCase):
 
                 proc = run_cmd(["token", "test"], repo, env={"XDG_CONFIG_HOME": xdg_home})
 
-                self.assertIn("[ok] project access", proc.stdout)
+                self.assertIn("[ok] 项目访问正常", proc.stdout)
 
 
 if __name__ == "__main__":

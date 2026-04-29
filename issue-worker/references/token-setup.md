@@ -70,12 +70,12 @@ Remove a saved token:
 issue-worker token remove
 ```
 
-The CLI first tries `git credential` for storage. If that is unavailable, it falls back to a local credentials file:
+The CLI stores tokens in a local credentials file to avoid system or git credential helpers prompting for an account password:
 
 - Linux/macOS: `~/.config/issue-worker/credentials.json`
 - Windows: `%APPDATA%\issue-worker\credentials.json` when `APPDATA` is available, otherwise the user's home config path
 
-The fallback file is machine-private. Keep permissions restricted and never commit it.
+The credentials file is machine-private. Keep permissions restricted and never commit it.
 
 ## GitHub Token
 

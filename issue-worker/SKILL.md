@@ -77,7 +77,7 @@ Environment variables are only temporary overrides:
 
 Do not ask users to permanently export provider tokens globally. Users may work with multiple GitHub, GitLab, Gitee, or self-hosted GitLab accounts, and global token exports are ambiguous and risky.
 
-Long-term credentials should use system or git credential storage first. Credential keys use:
+Long-term credentials should use the issue-worker private credentials file first, because system or git credential helpers can trigger confusing interactive password prompts. Credential keys use:
 
 ```text
 {provider}://{host}/{username}
@@ -92,7 +92,7 @@ gitlab://git.arlth.cn/huhw
 gitee://gitee.com/alice
 ```
 
-If git credential storage is unavailable, the CLI may fall back to a local private credentials file under the user's config directory, such as `~/.config/issue-worker/credentials.json` on Unix-like systems or the corresponding Windows config directory. Treat that file as machine-private and never commit it.
+The CLI stores tokens in a local private credentials file under the user's config directory, such as `~/.config/issue-worker/credentials.json` on Unix-like systems or the corresponding Windows config directory. Treat that file as machine-private and never commit it.
 
 ## Default Workflow
 
